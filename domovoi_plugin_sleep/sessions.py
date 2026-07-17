@@ -1,0 +1,214 @@
+"""Session + timer orchestration — the one place that writes
+``sleep_sessions``.
+
+One row per room (upserted): what's playing, since when, and when to
+stop. The timer worker enforces ``stop_at`` with a gentle volume fade,
+and its tick doubles as the reconciliation sweep: a session whose room
+is no longer playing our file (user said "stop the music", file reached
+its end, satellite skipped away) is marked inactive so the dashboard
+and voice status never lie. Durability lives in the row, not in any
+in-memory task — a core restart mid-nap changes nothing.
+
+Fade discipline: the satellite hardware mixer is the household's single
+volume control and core pins MPD at 100% (double-attenuation
+invariant). The fade deliberately dips that for a few seconds, then
+RESTORES the pre-fade level right after the stop — and if anything dies
+mid-fade, the provisioner re-pins volume on the next container start
+and any play/volume command re-pins it too. Bounded blast risk: none;
+bounded quiet risk: one pin away.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import text
+
+from domovoi.sdk import PluginSDK, Response
+
+from domovoi_plugin_sleep import SCHEMA, sounds
+
+log = logging.getLogger(__name__)
+
+NOW_PLAYING_SOURCE = "sleep"
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# ─── row access ───────────────────────────────────────────────────────────
+
+async def active_sessions(sdk: PluginSDK) -> list[dict[str, Any]]:
+    async with sdk.db.session_scope() as s:
+        rows = (
+            await s.execute(
+                text(
+                    f"SELECT room_id, sound_key, title, mpd_uri, started_at, "
+                    f"stop_at, active FROM {SCHEMA}.sleep_sessions "
+                    "WHERE active ORDER BY room_id"
+                )
+            )
+        ).mappings().all()
+        return [dict(r) for r in rows]
+
+
+async def _upsert_session(
+    sdk: PluginSDK,
+    *,
+    room_id: str,
+    sound: sounds.Sound,
+    mpd_uri: str,
+    stop_at: datetime | None,
+) -> None:
+    async with sdk.db.session_scope() as s:
+        await s.execute(
+            text(
+                f"""
+                INSERT INTO {SCHEMA}.sleep_sessions
+                    (room_id, sound_key, title, mpd_uri, started_at,
+                     stop_at, active, updated_at)
+                VALUES (:room, :key, :title, :uri, NOW(), :stop_at, TRUE, NOW())
+                ON CONFLICT (room_id) DO UPDATE SET
+                    sound_key = :key, title = :title, mpd_uri = :uri,
+                    started_at = NOW(), stop_at = :stop_at,
+                    active = TRUE, updated_at = NOW()
+                """
+            ),
+            {"room": room_id, "key": sound.key, "title": sound.title,
+             "uri": mpd_uri, "stop_at": stop_at},
+        )
+        await sdk.realtime.notify(s, "sessions_changed", "started")
+
+
+async def _deactivate(sdk: PluginSDK, room_id: str, reason: str) -> None:
+    async with sdk.db.session_scope() as s:
+        result = await s.execute(
+            text(
+                f"UPDATE {SCHEMA}.sleep_sessions "
+                "SET active = FALSE, updated_at = NOW() "
+                "WHERE room_id = :room AND active"
+            ),
+            {"room": room_id},
+        )
+        if (result.rowcount or 0) > 0:
+            await sdk.realtime.notify(s, "sessions_changed", reason)
+
+
+# ─── start / stop ─────────────────────────────────────────────────────────
+
+async def start(
+    sdk: PluginSDK,
+    *,
+    room_id: str,
+    sound: sounds.Sound,
+    timer_min: int | None,
+) -> Response:
+    """Queue the sound in the room's player and record the session.
+    ``timer_min``: None = the configured default; 0 = play to file end.
+    Returns play_url's Response — the caller returns it AS-IS (it may
+    overwrite ``.text``); on player failure it carries no
+    ``music_action`` and no session row is written."""
+    cfg = sdk.config
+    uri = sounds.mpd_uri(cfg, sound)
+
+    resp = await sdk.playback.play_url(
+        room_id,
+        uri,
+        title=sound.title,
+        artist=None,
+        source=NOW_PLAYING_SOURCE,
+        now_playing_data={"sound": sound.key},
+        record_play=True,
+    )
+    if resp.music_action != "start":
+        return resp                      # player refused; keep the row honest
+
+    minutes = int(cfg.default_timer_min) if timer_min is None else int(timer_min)
+    # The file itself is the fail-safe ceiling; a timer can only shorten.
+    minutes = min(minutes, int(cfg.file_length_min)) if minutes > 0 else 0
+    stop_at = _now() + timedelta(minutes=minutes) if minutes > 0 else None
+
+    await _upsert_session(
+        sdk, room_id=room_id, sound=sound, mpd_uri=uri, stop_at=stop_at
+    )
+    return resp
+
+
+async def stop(sdk: PluginSDK, room_id: str, *, fade: bool = True) -> Response:
+    """Fade (optionally) and stop the room, then deactivate the session."""
+    if fade and float(sdk.config.fade_out_sec) > 0:
+        try:
+            await _fade_down(sdk, room_id, float(sdk.config.fade_out_sec))
+        except Exception as e:  # noqa: BLE001 — fade is best-effort
+            log.debug("sleep: fade for room=%s failed: %s", room_id, e)
+    resp = await sdk.playback.stop(room_id)
+    await _restore_volume(sdk, room_id)
+    await _deactivate(sdk, room_id, "stopped")
+    return resp
+
+
+async def _fade_down(sdk: PluginSDK, room_id: str, fade_sec: float) -> None:
+    """Ramp the room's software mixer down over ``fade_sec`` in a few
+    steps. The pre-fade level is restored by ``_restore_volume`` right
+    after the stop (see module docstring for the invariant)."""
+    client = await sdk.playback.mpd_client_for(room_id)
+    start_level = await client.get_volume()
+    if start_level is None or start_level <= 0:
+        return
+    sdk.state[f"prefade_volume:{room_id}"] = int(start_level)
+    steps = 6
+    for i in range(1, steps + 1):
+        level = int(start_level * (steps - i) / steps)
+        await client.set_volume(max(level, 0))
+        await asyncio.sleep(fade_sec / steps)
+
+
+async def _restore_volume(sdk: PluginSDK, room_id: str) -> None:
+    level = sdk.state.pop(f"prefade_volume:{room_id}", None)
+    if level is None:
+        return
+    try:
+        client = await sdk.playback.mpd_client_for(room_id)
+        await client.set_volume(int(level))
+    except Exception as e:  # noqa: BLE001 — the provisioner pin is the net
+        log.debug("sleep: volume restore for room=%s failed: %s", room_id, e)
+
+
+# ─── the timer tick ───────────────────────────────────────────────────────
+
+async def enforce(sdk: PluginSDK) -> None:
+    """One worker tick: stop due sessions (fade included, timed so the
+    sound is silent AT ``stop_at``), then reconcile rows against what
+    the rooms are actually playing."""
+    fade_sec = float(sdk.config.fade_out_sec)
+
+    for session in await active_sessions(sdk):
+        room_id = session["room_id"]
+        stop_at = session["stop_at"]
+
+        # 1. Timer due? Start the fade early enough to finish on time.
+        if stop_at is not None:
+            due_at = stop_at - timedelta(seconds=fade_sec)
+            if _now() >= due_at:
+                log.info("sleep: timer elapsed for room=%s", room_id)
+                await stop(sdk, room_id, fade=True)
+                continue
+
+        # 2. Reconcile: is the room still playing OUR file? "pause" is
+        #    kept — that's the satellite handshake window right after
+        #    start, and a user-paused nap sound shouldn't lose its timer.
+        try:
+            client = await sdk.playback.mpd_client_for(room_id)
+            state = await client.state()
+            current = await client.current_song() or {}
+        except Exception as e:  # noqa: BLE001 — player unreachable ≠ session over
+            log.debug("sleep: reconcile skip room=%s: %s", room_id, e)
+            continue
+        if state == "stop" or current.get("file") != session["mpd_uri"]:
+            # File ended on its own, or something else took the room.
+            sdk.now_playing.clear(room_id, source=NOW_PLAYING_SOURCE)
+            await _deactivate(sdk, room_id, "ended")

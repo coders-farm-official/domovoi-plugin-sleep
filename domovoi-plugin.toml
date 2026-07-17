@@ -1,0 +1,82 @@
+# domovoi-plugin.toml — the sleep-sounds plugin manifest.
+#
+# NOTE (manifest/code drift rule): everything declared here is
+# cross-checked against what register() actually registers at install
+# time. Code is authoritative — a value mismatch fails the install.
+
+[plugin]
+slug = "sleep"
+name = "Sleep Sounds"
+version = "1.0.0"
+publisher = "Coders Farm"
+license = "MIT"
+description = "Per-room sleep sounds, synthesized locally with ffmpeg (white / pink / brown noise, soft fan, ocean swells) — no downloads, no accounts, works fully offline. 'Play brown noise in the bedroom for 45 minutes' fades out and stops on its own; drop your own recordings into the sounds folder to add more."
+homepage = "https://github.com/coders-farm-official/domovoi-plugin-sleep"
+domovoi_api = ">=1.0,<2.0"
+
+[entry_points]
+core = "domovoi_plugin_sleep.core"
+web = "domovoi_plugin_sleep.web"
+
+[capabilities]
+provides = ["now-playing-source:sleep", "now-playing-matcher"]
+
+[requirements]
+# No Python requirements. ffmpeg synthesizes every sound locally.
+system = [
+  { tool = "ffmpeg", required = true, help = "Sounds are generated locally with ffmpeg's noise synthesizer (no downloads). Core installs already need ffmpeg for the radio plugin; install from ffmpeg.org and put it on PATH." },
+]
+
+[[handlers]]
+name = "sleep"
+# 275: anchored-media range, between spoken_audio (270) and radio (280),
+# ahead of music's greedy `^play (.+)$` at 300 so "play brown noise"
+# is claimed here (same etiquette as radio's "play 97.5 fm" at 280).
+band = 275
+requires_network = "no"
+label = "Sleep sounds"
+tone = "media"
+icon = "web/static/icon.svg"
+corpus = [
+  "play white noise",
+  "play ocean sounds in the bedroom",
+  "play brown noise for 30 minutes",
+  "stop the sleep sounds",
+]
+
+[[workers]]
+name = "sleep_timer"
+kind = "poll"
+[[workers]]
+name = "sleep_generator"
+kind = "startup"
+
+[config]
+env_prefix = "SLEEP_"
+
+[permissions]
+subprocess = true
+filesystem_outside_data = true
+warnings = [
+  "Runs ffmpeg on your machine to synthesize the sound files (one-time, a few seconds per sound; regenerated only when settings change).",
+  "Writes the generated sound files into a subfolder of your music library (default 'Ambient sounds', roughly 30 MB per hour per sound) so the per-room players can play them.",
+  "Needs no network at all — nothing is downloaded and nothing leaves your machine.",
+]
+
+[web]
+scripts = ["web/static/sleep.jsx"]
+
+[[web.pages]]
+route = "sleep"
+page = "SleepPage"
+nav_label = "Sleep"
+nav_icon = "web/static/icon.svg"
+nav_order = 57
+
+[[realtime]]
+notify_channel = "plugin_sleep_sessions_changed"
+realtime_channel = "sleep.sessions"
+snapshot = "snapshot_sessions"
+
+[assets]
+migrations_dir = "migrations"
