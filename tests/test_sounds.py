@@ -74,6 +74,12 @@ def test_catalog_missing_folder_is_empty(tmp_path):
         ("waves", "ocean"),                  # alias
         ("the ocean", "ocean"),              # alias
         ("fan", "fan"),
+        ("rain", "rain"),                    # natural pack
+        ("thunder", "thunderstorm"),         # alias
+        ("storm", "thunderstorm"),           # alias
+        ("fireplace", "campfire"),           # alias
+        ("creek", "stream"),                 # alias
+        ("crickets", "crickets"),
         ("rain on tent", "rain on tent"),    # user file
         ("Rain On Tent", "rain on tent"),
     ],
@@ -81,7 +87,8 @@ def test_catalog_missing_folder_is_empty(tmp_path):
 def test_resolve_variants(tmp_path, spoken, expected_key):
     cfg = make_settings()
     folder = _seed_builtins(
-        tmp_path, cfg, "white-noise", "brown-noise", "soft-fan", "ocean"
+        tmp_path, cfg, "white-noise", "brown-noise", "soft-fan", "ocean",
+        "rain", "thunderstorm", "campfire", "stream", "crickets",
     )
     (folder / "rain on tent.mp3").write_bytes(b"mp3")
     sound = sounds.resolve(cfg, str(tmp_path / "music"), spoken)
@@ -107,29 +114,39 @@ def test_mpd_uri_is_subdir_relative(tmp_path):
 
 @pytest.fixture
 def fake_ffmpeg(monkeypatch):
-    """Stands in for ffmpeg: records invocations and creates the output
-    file (the last argument), like the real render would."""
+    """Stands in for ffmpeg AND the numpy natural renderer: records
+    invocations and creates the output file, like the real ones would
+    (rendering an hour of audio has no place in the unit tier)."""
     calls: list[tuple[str, ...]] = []
 
     async def _run(*args, timeout=600.0):
         calls.append(args)
         Path(args[-1]).write_bytes(b"ogg")
 
+    def _render_wav(key, out_path, *, duration_sec, stereo=False):
+        calls.append(("render_wav", key, str(duration_sec)))
+        Path(out_path).write_bytes(b"wav")
+
     monkeypatch.setattr(sounds, "_run_ffmpeg", _run)
+    monkeypatch.setattr(sounds.synth, "render_wav", _render_wav)
     return calls
 
 
 async def test_generate_fresh_renders_all(tmp_path, fake_ffmpeg):
     cfg = make_settings()
     generated = await sounds.generate_builtins(cfg, str(tmp_path / "music"))
-    assert len(generated) == 5
+    assert len(generated) == 11          # 5 ffmpeg recipes + 6 natural
     folder = _folder(tmp_path, cfg)
     assert (folder / "brown-noise.ogg").exists()
+    assert (folder / "rain.ogg").exists()
+    assert not (folder / "rain.wav.tmp").exists()   # temp WAV cleaned up
     sidecar = json.loads((folder / sounds.SIDECAR_NAME).read_text())
     assert sidecar["file_length_min"] == cfg.file_length_min
+    assert sidecar["natural_version"] == sounds.synth.NATURAL_VERSION
     # Mono by default; duration is minutes*60.
     assert any("-ac" in c and "1" in c for c in fake_ffmpeg)
     assert any(str(cfg.file_length_min * 60) in c for c in fake_ffmpeg)
+    assert ("render_wav", "rain", str(float(cfg.file_length_min * 60))) in fake_ffmpeg
 
 
 async def test_generate_skips_when_fresh(tmp_path, fake_ffmpeg):
@@ -148,7 +165,7 @@ async def test_generate_regenerates_on_param_drift(tmp_path, fake_ffmpeg):
 
     longer = make_settings(file_length_min=120)
     generated = await sounds.generate_builtins(longer, str(tmp_path / "music"))
-    assert len(generated) == 5
+    assert len(generated) == 11
     assert any("7200" in c for c in fake_ffmpeg)
 
 

@@ -60,8 +60,13 @@ def test_manifest_parses_and_declares_the_contract():
     assert len(m.warnings) >= 3
 
 
-def test_no_python_requirements_means_no_lockfile_needed():
+def test_requirements_numpy_pin_matches_radio_and_lockfile_exists():
     m = parse_manifest_dir(PLUGIN_ROOT)
-    assert m.python_requirements == ()
+    # Same pin as the bundled radio plugin -> refcounted shared dist,
+    # effectively already installed everywhere.
+    assert m.python_requirements == ("numpy==2.1.2",)
+    assert m.lockfile == "requirements.lock"
+    lock = (PLUGIN_ROOT / "requirements.lock").read_text(encoding="utf-8")
+    assert "numpy==2.1.2" in lock and "--hash=" in lock
     tools = {t.tool: t.required for t in m.system_requirements}
     assert tools == {"ffmpeg": True}

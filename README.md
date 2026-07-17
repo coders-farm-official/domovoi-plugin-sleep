@@ -3,13 +3,19 @@
 A [Domovoi](https://github.com/coders-farm-official/domovoi) plugin for
 per-room sleep sounds. Published by Coders Farm, MIT licensed.
 
-> "play brown noise in the bedroom for 45 minutes"
+> "play rain sounds in the bedroom for 45 minutes"
 
-The sounds come from **nowhere**: ffmpeg synthesizes them locally —
-white, pink, and brown noise, a soft fan, and slow ocean swells. No
-downloads, no accounts, no licensing, fully offline, forever. Timers
-fade the sound out gently, every file ends on its own as a fail-safe,
-and each room runs independently through its own player.
+The sounds come from **nowhere**: they're synthesized locally. ffmpeg's
+noise generator makes the abstract five (white / pink / brown noise,
+soft fan, ocean swells), and a numpy DSP renderer makes the natural six
+the way white-noise apps actually do — **rain** (droplet transients
+over a patter bed), **thunderstorm** (rain plus long low rumbles),
+**wind** (a slow gusting envelope), **crickets** (pulsed ~4.5 kHz
+chirps), **campfire** (crackle and pops over a warm rumble), and
+**stream** (independently burbling midband layers). No downloads, no
+accounts, no licensing, fully offline, forever. Timers fade the sound
+out gently, every file ends on its own as a fail-safe, and each room
+runs independently through its own player.
 
 ## What you get
 
@@ -36,12 +42,21 @@ Dashboard → **Plugins** → install, then either:
 * **Zip upload** — build one with `domovoi plugin pack .` from this directory
 
 Requirements: `ffmpeg` on PATH (Domovoi installs already have it — the
-radio plugin requires it too). No Python dependencies, **no network**.
+radio plugin requires it too) and `numpy` (pinned to the exact version
+the bundled radio plugin already ships, so nothing new actually
+installs). **No network.**
 
-First start renders the five sound files (a few minutes of ffmpeg,
-one-time); the voice handler and Sleep tab answer honestly until
-they're ready. Files are re-rendered only when generation settings
-change.
+First start renders the eleven sound files (a few minutes, one-time);
+the voice handler and Sleep tab answer honestly until they're ready.
+Files are re-rendered only when generation settings change. Rendering
+briefly uses ~300 MB of temp disk per natural sound (a WAV that is
+encoded to OGG and deleted).
+
+Prefer AI-generated or recorded textures? Generate them anywhere (e.g.
+Google's MusicFX / Lyria in AI Studio), download, and drop the files
+into the sounds folder — they become voice-addressable by filename. The
+plugin itself ships only what it synthesizes, so its zero-network,
+zero-licensing story stays intact.
 
 ## Settings (dashboard → Settings → Plugins → Sleep Sounds)
 

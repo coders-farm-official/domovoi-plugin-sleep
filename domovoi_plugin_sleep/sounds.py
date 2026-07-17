@@ -28,6 +28,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from domovoi_plugin_sleep import synth
+
 log = logging.getLogger(__name__)
 
 # Version bump forces regeneration of every builtin (recipe changes).
@@ -94,6 +96,20 @@ ALIASES: dict[str, str] = {
     "waves": "ocean",
     "the ocean": "ocean",
     "sea": "ocean",
+    # natural pack (synth.py)
+    "raining": "rain",
+    "thunder": "thunderstorm",
+    "storm": "thunderstorm",
+    "rain storm": "thunderstorm",
+    "fire": "campfire",
+    "fireplace": "campfire",
+    "crackling fire": "campfire",
+    "cricket": "crickets",
+    "night": "crickets",
+    "creek": "stream",
+    "river": "stream",
+    "brook": "stream",
+    "babbling brook": "stream",
 }
 
 
@@ -113,6 +129,7 @@ def normalize_key(raw: str) -> str:
 def _wanted_params(cfg) -> dict:
     return {
         "recipe_version": RECIPE_VERSION,
+        "natural_version": synth.NATURAL_VERSION,
         "file_length_min": int(cfg.file_length_min),
         "stereo": bool(cfg.stereo),
     }
@@ -181,6 +198,35 @@ async def generate_builtins(cfg, music_dir: str) -> list[str]:
         out.with_suffix(".ogg.tmp").replace(out)
         generated.append(key)
 
+    # The natural pack: numpy renders a temp WAV (streamed, so an hour
+    # of audio never lives in memory — but it does briefly live on disk,
+    # ~300 MB per hour), ffmpeg encodes it, the WAV is deleted.
+    for key, (title, stem, _seed) in synth.NATURAL_SOUNDS.items():
+        out = folder / f"{stem}.ogg"
+        if out.exists() and not drifted:
+            continue
+        log.info("sleep: rendering %s (%d min)", title, cfg.file_length_min)
+        wav_tmp = folder / f"{stem}.wav.tmp"
+        try:
+            await asyncio.to_thread(
+                synth.render_wav,
+                key,
+                wav_tmp,
+                duration_sec=float(duration_sec),
+                stereo=bool(cfg.stereo),
+            )
+            await _run_ffmpeg(
+                "-i", str(wav_tmp),
+                "-c:a", "libvorbis", "-q:a", "2",
+                "-metadata", f"title={title}",
+                "-metadata", "artist=Domovoi sleep sounds",
+                str(out.with_suffix(".ogg.tmp")),
+            )
+            out.with_suffix(".ogg.tmp").replace(out)
+            generated.append(key)
+        finally:
+            wav_tmp.unlink(missing_ok=True)
+
     (folder / SIDECAR_NAME).write_text(
         json.dumps(wanted, indent=2), encoding="utf-8"
     )
@@ -196,8 +242,13 @@ def catalog(cfg, music_dir: str) -> dict[str, Sound]:
     folder = sounds_dir(music_dir, cfg.sounds_subdir)
     out: dict[str, Sound] = {}
 
-    builtin_files = {stem for _, stem, _ in _RECIPES.values()}
-    for key, (title, stem, _graph) in _RECIPES.items():
+    builtin_entries = [
+        (key, title, stem) for key, (title, stem, _g) in _RECIPES.items()
+    ] + [
+        (key, title, stem) for key, (title, stem, _s) in synth.NATURAL_SOUNDS.items()
+    ]
+    builtin_files = {stem for _, _, stem in builtin_entries}
+    for key, title, stem in builtin_entries:
         if (folder / f"{stem}.ogg").exists():
             out[key] = Sound(key=key, title=title, filename=f"{stem}.ogg", builtin=True)
 
