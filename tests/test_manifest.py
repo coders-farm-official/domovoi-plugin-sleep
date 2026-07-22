@@ -61,12 +61,23 @@ def test_manifest_parses_and_declares_the_contract():
 
 
 def test_requirements_numpy_pin_matches_radio_and_lockfile_exists():
+    import re
+
+    import domovoi
+
     m = parse_manifest_dir(PLUGIN_ROOT)
     # Same pin as the bundled radio plugin -> refcounted shared dist,
-    # effectively already installed everywhere.
-    assert m.python_requirements == ("numpy==2.1.2",)
+    # effectively already installed everywhere. Derived from radio's
+    # actual lock (not hardcoded) so a coordinated version bump can't
+    # leave this test asserting a stale literal.
+    radio_lock = (
+        Path(domovoi.__file__).resolve().parents[1]
+        / "plugins" / "radio" / "requirements.lock"
+    ).read_text(encoding="utf-8")
+    radio_numpy = re.search(r"^numpy==\S+", radio_lock, re.M).group(0)
+    assert m.python_requirements == (radio_numpy,)
     assert m.lockfile == "requirements.lock"
     lock = (PLUGIN_ROOT / "requirements.lock").read_text(encoding="utf-8")
-    assert "numpy==2.1.2" in lock and "--hash=" in lock
+    assert radio_numpy in lock and "--hash=" in lock
     tools = {t.tool: t.required for t in m.system_requirements}
     assert tools == {"ffmpeg": True}
