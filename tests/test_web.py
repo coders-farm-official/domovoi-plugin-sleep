@@ -39,15 +39,20 @@ class _RecordingCore:
     def __init__(self) -> None:
         self.fail = False
         self.posts: list[tuple[str, dict | None, bool]] = []  # (path, json, had_request)
+        self.sounds_payload: dict | None = None      # override for stream tests
+        self.status_payload: dict = {"startup_hooks": []}
 
     async def get(self, path: str, *, params=None):
         if self.fail:
             raise RuntimeError("core service unreachable")
         if path.endswith("/sounds"):
-            return {
-                "sounds": [{"key": "brown noise", "title": "Brown noise", "builtin": True}],
+            return self.sounds_payload or {
+                "sounds": [{"key": "brown noise", "title": "Brown noise",
+                            "builtin": True, "filename": "brown-noise.ogg"}],
                 "generating": False,
             }
+        if path.endswith("/status"):
+            return self.status_payload
         return {"sessions": [], "default_timer_min": 45, "file_length_min": 60}
 
     async def post(self, path: str, *, json=None):
@@ -156,6 +161,78 @@ def test_regenerate_forwards_admin_credential(web_client) -> None:
     resp = client.post("/api/plugins/sleep/regenerate")
     assert resp.status_code == 200
     assert ("regenerate", None, True) in ctx.core.posts
+
+
+# ─── Browser stream route ([[web.player_sources]]) ───────────────────────
+
+def _sounds_payload(tmp_path: Path, filename: str = "brown-noise.ogg") -> dict:
+    return {
+        "sounds": [{"key": "brown noise", "title": "Brown noise",
+                    "builtin": True, "filename": filename}],
+        "dir": str(tmp_path),
+        "generating": False,
+    }
+
+
+def test_stream_serves_sound_file(web_client, tmp_path) -> None:
+    ctx, client = web_client
+    (tmp_path / "brown-noise.ogg").write_bytes(b"OggS fake audio")
+    ctx.core.sounds_payload = _sounds_payload(tmp_path)
+    resp = client.get("/api/plugins/sleep/sounds/brown%20noise/stream")
+    assert resp.status_code == 200
+    assert resp.content == b"OggS fake audio"
+    assert resp.headers["content-type"].startswith("audio/ogg")
+
+
+def test_stream_unknown_sound_404(web_client, tmp_path) -> None:
+    ctx, client = web_client
+    ctx.core.sounds_payload = _sounds_payload(tmp_path)
+    resp = client.get("/api/plugins/sleep/sounds/whale%20songs/stream")
+    assert resp.status_code == 404
+
+
+def test_stream_refuses_path_escape(web_client, tmp_path) -> None:
+    ctx, client = web_client
+    (tmp_path / "secret.txt").write_text("nope")
+    inside = tmp_path / "sounds"
+    inside.mkdir()
+    payload = _sounds_payload(inside, filename="../secret.txt")
+    ctx.core.sounds_payload = payload
+    resp = client.get("/api/plugins/sleep/sounds/brown%20noise/stream")
+    assert resp.status_code == 400
+
+
+def test_stream_missing_file_409(web_client, tmp_path) -> None:
+    ctx, client = web_client
+    ctx.core.sounds_payload = _sounds_payload(tmp_path)   # file never written
+    resp = client.get("/api/plugins/sleep/sounds/brown%20noise/stream")
+    assert resp.status_code == 409
+
+
+def test_stream_core_down_503(web_client) -> None:
+    ctx, client = web_client
+    ctx.core.fail = True
+    resp = client.get("/api/plugins/sleep/sounds/brown%20noise/stream")
+    assert resp.status_code == 503
+
+
+@requires_db
+def test_overview_surfaces_generator_error(web_client) -> None:
+    """Empty catalog + failed hook → the page gets the honest reason
+    instead of rendering silently empty (the exact state a first-boot
+    ffmpeg failure leaves behind)."""
+    ctx, client = web_client
+    ctx.core.sounds_payload = {"sounds": [], "generating": False}
+    ctx.core.status_payload = {
+        "startup_hooks": [
+            {"name": "sleep.sleep_generator", "state": "failed",
+             "error": "ffmpeg failed: Unable to choose an output format"}
+        ]
+    }
+    resp = client.get("/api/plugins/sleep/overview")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "Unable to choose an output format" in body["generator_error"]
 
 
 @requires_db

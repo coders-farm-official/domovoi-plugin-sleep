@@ -10,6 +10,8 @@
  *   * GET  /api/plugins/sleep/overview      — rooms, sessions, catalog
  *   * POST /api/plugins/sleep/play|stop     — open (daily-use)
  *   * POST /api/plugins/sleep/regenerate    — admin
+ *   * GET  /api/plugins/sleep/sounds/{key}/stream — browser playback
+ *     (the manifest's [[web.player_sources]] route, via usePlayback)
  *   * /ws/state · `sleep.sessions.changed`  — live refetch nudge
  *
  * Countdowns are computed CLIENT-SIDE from each session's fixed
@@ -18,11 +20,29 @@
  *
  * Core-bundle globals used (loaded before any plugin script): React,
  * Card, Button, Icon, Pill, Empty, PageHeader, RoomChip, useToast,
- * apiPost, useApiObject.
+ * apiPost, useApiObject, usePlayback.
  */
 
 const SLEEP_API = '/api/plugins/sleep';
 const TIMER_PRESETS = [15, 30, 45, 60];   // minutes; 0 = to file end
+
+/* Queue item for the shared browser player (same shape radio builds
+ * against its stream proxy). Finite files, so a duration renders a
+ * real progress bar; not library tracks, so never offline-cached. */
+const sleepQueueItem = (s, durationSec) => ({
+  uid: `sleep-${s.key}-${Math.random().toString(36).slice(2, 7)}`,
+  kind: 'sleep',
+  trackId: null,
+  title: s.title,
+  artist: 'Domovoi sleep sounds',
+  album: '',
+  src: `${SLEEP_API}/sounds/${encodeURIComponent(s.key)}/stream`,
+  coverUrl: null,
+  durationSec: durationSec || null,
+  seekable: true,
+  cacheable: false,
+  meta: {},
+});
 
 /* mm:ss (or h:mm:ss) until an ISO timestamp; null when past/absent. */
 const countdownTo = (iso, nowMs) => {
@@ -123,6 +143,59 @@ const RoomCard = ({ room, session, sounds, defaults, busy, onPlay, onStop, nowMs
   );
 };
 
+/* ---- Play-in-this-browser card ------------------------------------ */
+/* The no-satellite path: sounds play through the app-level browser
+ * player (mini-player bar), with its sleep timer driving the fade-out
+ * the room path gets from the timer worker. */
+const BrowserPlayCard = ({ sounds, defaults, fire }) => {
+  const player = usePlayback();
+  const [minutes, setMinutes] = React.useState(null);
+  const chosenMinutes = minutes == null
+    ? (defaults.default_timer_min ?? 45)
+    : minutes;
+
+  const onPlayHere = (s) => {
+    if (!player.available) { fire('browser player not available'); return; }
+    const durationSec = (defaults.file_length_min || 0) * 60;
+    player.playItems([sleepQueueItem(s, durationSec)]);
+    if (chosenMinutes > 0) player.setSleep(chosenMinutes);
+    fire(chosenMinutes > 0
+      ? `${s.title.toLowerCase()} here for ${chosenMinutes} min`
+      : `${s.title.toLowerCase()} here — plays to file end`);
+  };
+
+  return (
+    <Card title="play in this browser">
+      <div style={{ padding: '4px 14px 14px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+          {sounds.map(s => (
+            <button key={s.key} className="btn btn-secondary"
+                    onClick={() => onPlayHere(s)}>
+              {s.title.toLowerCase()}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <span style={{ fontSize: 11, color: 'var(--fg-muted)' }}>stop after</span>
+          {TIMER_PRESETS.map(m => (
+            <button key={m}
+                    className={`btn ${chosenMinutes === m ? 'btn-primary' : 'btn-ghost'}`}
+                    style={{ fontSize: 11 }}
+                    onClick={() => setMinutes(m)}>
+              {m}m
+            </button>
+          ))}
+          <button className={`btn ${chosenMinutes === 0 ? 'btn-primary' : 'btn-ghost'}`}
+                  style={{ fontSize: 11 }}
+                  onClick={() => setMinutes(0)}>
+            file end
+          </button>
+        </div>
+      </div>
+    </Card>
+  );
+};
+
 /* ---- Page ---------------------------------------------------------- */
 const SleepPage = () => {
   const [fire, toastNode] = useToast();
@@ -139,6 +212,16 @@ const SleepPage = () => {
   const defaults = overview?.defaults || {};
   const nowMs = useNow(sessions.length > 0);
   const byRoom = Object.fromEntries(sessions.map(s => [s.room_id, s]));
+
+  // First-run rendering takes minutes and there's no NOTIFY for it —
+  // poll gently while the core reports generation in flight so the
+  // sounds appear without a manual reload.
+  const generating = !!overview?.generating;
+  React.useEffect(() => {
+    if (!generating) return;
+    const t = setInterval(refresh, 10000);
+    return () => clearInterval(t);
+  }, [generating, refresh]);
 
   const onPlay = async (room, sound, minutes) => {
     setBusy(true);
@@ -161,6 +244,21 @@ const SleepPage = () => {
       refresh();
     } catch (e) {
       fire(`stop failed: ${e.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const onRegenerate = async () => {
+    setBusy(true);
+    try {
+      await apiPost(`${SLEEP_API}/regenerate`, {});
+      fire('rendering sounds — this takes a few minutes');
+      refresh();
+    } catch (e) {
+      // 401/403 pops the admin login modal (data.js); anything else is
+      // an honest failure toast.
+      fire(`couldn't start rendering: ${e.message}`);
     } finally {
       setBusy(false);
     }
@@ -189,6 +287,29 @@ const SleepPage = () => {
           </div>
         </Card>
       )}
+      {overview && overview.core_online !== false && !overview.generating
+        && sounds.length === 0 && overview.generator_error && (
+        <Card>
+          <div style={{ padding: '10px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div style={{ fontSize: 12, color: 'var(--warn)' }}>
+              sound generation failed — no files were rendered
+            </div>
+            <div className="mono" style={{ fontSize: 11, color: 'var(--fg-muted)',
+                                           whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+              {String(overview.generator_error).slice(0, 300)}
+            </div>
+            <div>
+              <Button icon="refresh-cw" disabled={busy} onClick={onRegenerate}>
+                retry rendering
+              </Button>
+            </div>
+          </div>
+        </Card>
+      )}
+
+      {sounds.length > 0 && (
+        <BrowserPlayCard sounds={sounds} defaults={defaults} fire={fire}/>
+      )}
 
       {loading && !overview ? (
         <div style={{ padding: 28, textAlign: 'center', fontSize: 12, color: 'var(--fg-muted)' }}>
@@ -198,7 +319,7 @@ const SleepPage = () => {
         <Card>
           <Empty
             title="no rooms yet"
-            sub="connect a satellite — each room gets its own sleep sounds"
+            sub="connect a satellite for per-room playback — until then, sounds play right here in the browser"
           />
         </Card>
       ) : (

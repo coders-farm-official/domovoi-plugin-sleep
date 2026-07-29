@@ -162,6 +162,25 @@ async def _run_ffmpeg(*args: str, timeout: float = 600.0) -> None:
         raise RuntimeError(f"ffmpeg failed: {err}")
 
 
+async def _encode_ogg(
+    input_args: list[str], out: Path, title: str, *, timeout: float = 600.0
+) -> None:
+    """Encode to ``<out>.tmp`` and atomically move into place so MPD
+    never indexes a half-written file. The temp name ends in ``.tmp``,
+    which ffmpeg can't infer a muxer from — ``-f ogg`` pins it."""
+    tmp = out.with_suffix(".ogg.tmp")
+    await _run_ffmpeg(
+        *input_args,
+        "-c:a", "libvorbis", "-q:a", "2",
+        "-metadata", f"title={title}",
+        "-metadata", "artist=Domovoi sleep sounds",
+        "-f", "ogg",
+        str(tmp),
+        timeout=timeout,
+    )
+    tmp.replace(out)
+
+
 async def generate_builtins(cfg, music_dir: str) -> list[str]:
     """Render every builtin whose file is missing or whose params
     drifted from the sidecar. Returns the keys (re)generated. Raises
@@ -183,19 +202,16 @@ async def generate_builtins(cfg, music_dir: str) -> list[str]:
         if out.exists() and not drifted:
             continue
         log.info("sleep: rendering %s (%d min)", title, cfg.file_length_min)
-        await _run_ffmpeg(
-            "-f", "lavfi",
-            "-i", filtergraph,
-            "-t", str(duration_sec),
-            "-ac", channels,
-            "-ar", "44100",
-            "-c:a", "libvorbis", "-q:a", "2",
-            "-metadata", f"title={title}",
-            "-metadata", "artist=Domovoi sleep sounds",
-            str(out.with_suffix(".ogg.tmp")),
+        await _encode_ogg(
+            [
+                "-f", "lavfi",
+                "-i", filtergraph,
+                "-t", str(duration_sec),
+                "-ac", channels,
+                "-ar", "44100",
+            ],
+            out, title,
         )
-        # Atomic-ish move so MPD never indexes a half-written file.
-        out.with_suffix(".ogg.tmp").replace(out)
         generated.append(key)
 
     # The natural pack: numpy renders a temp WAV (streamed, so an hour
@@ -215,14 +231,7 @@ async def generate_builtins(cfg, music_dir: str) -> list[str]:
                 duration_sec=float(duration_sec),
                 stereo=bool(cfg.stereo),
             )
-            await _run_ffmpeg(
-                "-i", str(wav_tmp),
-                "-c:a", "libvorbis", "-q:a", "2",
-                "-metadata", f"title={title}",
-                "-metadata", "artist=Domovoi sleep sounds",
-                str(out.with_suffix(".ogg.tmp")),
-            )
-            out.with_suffix(".ogg.tmp").replace(out)
+            await _encode_ogg(["-i", str(wav_tmp)], out, title)
             generated.append(key)
         finally:
             wav_tmp.unlink(missing_ok=True)

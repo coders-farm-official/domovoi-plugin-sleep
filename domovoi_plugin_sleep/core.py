@@ -60,12 +60,19 @@ def register(ctx: Any) -> None:
 
     async def _generate() -> None:
         """Render missing/drifted sounds, then the MPD rescan fan-out.
-        Under stubs (test cores) nothing touches disk or ffmpeg."""
+        Under stubs (test cores) nothing touches disk or ffmpeg.
+        ``regen_running`` is set here too — not just in /regenerate — so
+        the dashboard's "rendering…" card and its poll cover the first
+        boot, when this render is the whole page's story."""
         if sdk.core_config.use_stubs:
             return
-        generated = await sounds.generate_builtins(
-            sdk.config, sdk.core_config.music_dir
-        )
+        sdk.state["regen_running"] = True
+        try:
+            generated = await sounds.generate_builtins(
+                sdk.config, sdk.core_config.music_dir
+            )
+        finally:
+            sdk.state["regen_running"] = False
         if generated:
             log.info("sleep: generated %d sound(s): %s",
                      len(generated), ", ".join(generated))
@@ -143,12 +150,24 @@ def _build_core_router(sdk: PluginSDK) -> APIRouter:
 
     @router.get("/sounds")
     async def list_sounds():
+        """Catalog + the on-disk location. ``dir``/``filename`` exist for
+        the web process's browser-stream route (same host, separate
+        process — it can read the files but doesn't know MUSIC_DIR)."""
         cat = sounds.catalog(sdk.config, sdk.core_config.music_dir)
+        folder = sounds.sounds_dir(
+            sdk.core_config.music_dir, sdk.config.sounds_subdir
+        )
         return {
             "sounds": [
-                {"key": s.key, "title": s.title, "builtin": s.builtin}
+                {
+                    "key": s.key,
+                    "title": s.title,
+                    "builtin": s.builtin,
+                    "filename": s.filename,
+                }
                 for s in cat.values()
             ],
+            "dir": str(folder),
             "generating": sdk.state.get("regen_running", False),
         }
 

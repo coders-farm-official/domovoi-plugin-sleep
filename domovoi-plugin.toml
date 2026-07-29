@@ -7,7 +7,7 @@
 [plugin]
 slug = "sleep"
 name = "Sleep Sounds"
-version = "1.1.1"
+version = "1.2.0"
 publisher = "Coders Farm"
 license = "MIT"
 description = "Per-room sleep sounds, synthesized locally (white / pink / brown noise, soft fan, ocean swells, plus procedurally generated rain, thunderstorm, wind, crickets, campfire, and stream) — no downloads, no accounts, works fully offline. 'Play rain sounds in the bedroom for 45 minutes' fades out and stops on its own; drop your own recordings into the sounds folder to add more."
@@ -77,6 +77,13 @@ page = "SleepPage"
 nav_label = "Sleep"
 nav_icon = "web/static/icon.svg"
 nav_order = 57
+
+# Teaches the dashboard's browser player how to stream sleep sounds —
+# the page can play them locally (no satellite needed), same media
+# player the music/radio pages share.
+[[web.player_sources]]
+kind = "sleep"
+stream_url_template = "/api/plugins/sleep/sounds/{id}/stream"
 
 [[realtime]]
 notify_channel = "plugin_sleep_sessions_changed"

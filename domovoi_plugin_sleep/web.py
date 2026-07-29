@@ -24,14 +24,27 @@ the snapshot stays diff-stable).
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
+
+# Suffix → media type for the browser stream route. Matches the audio
+# extensions the catalog accepts for user-dropped files.
+_AUDIO_TYPES = {
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+}
 
 
 class PlayBody(BaseModel):
@@ -75,6 +88,7 @@ def build_router(ctx: Any) -> APIRouter:
         catalog: list[dict[str, Any]] = []
         defaults: dict[str, Any] = {}
         generating = False
+        generator_error: str | None = None
         try:
             snd = await ctx.core.get("/v1/plugins/sleep/sounds")
             catalog = snd.get("sounds", [])
@@ -84,6 +98,19 @@ def build_router(ctx: Any) -> APIRouter:
                 "default_timer_min": state.get("default_timer_min"),
                 "file_length_min": state.get("file_length_min"),
             }
+            if not catalog and not generating:
+                # Empty catalog with nothing running — the one state
+                # where the generator hook's failure is the page's whole
+                # story, so pull it from the plugin status (extra core
+                # round-trip only on this already-broken path; its own
+                # failure just leaves the error unexplained).
+                try:
+                    status = await ctx.core.get("/v1/plugins/sleep/status")
+                    for hook in status.get("startup_hooks", []):
+                        if hook.get("name", "").endswith("sleep_generator"):
+                            generator_error = hook.get("error")
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as e:  # noqa: BLE001 — core down is a rendered state
             log.debug("sleep overview: core fetch failed: %s", e)
             core_online = False
@@ -93,6 +120,7 @@ def build_router(ctx: Any) -> APIRouter:
             "sessions": sessions,
             "sounds": catalog,
             "generating": generating,
+            "generator_error": generator_error,
             "defaults": defaults,
             "core_online": core_online,
         }
@@ -113,6 +141,51 @@ def build_router(ctx: Any) -> APIRouter:
     @router.post("/regenerate")
     async def regenerate(request: Request) -> dict[str, Any]:
         return await ctx.core.post_admin("regenerate", request=request)
+
+    # ── Browser stream (the manifest's [[web.player_sources]] route) ──
+    #
+    # The dashboard player streams sounds through this route so the
+    # sleep page can play in the browser — same posture as radio's
+    # stream proxy (§9.1), except the "stream" is a local file: the
+    # catalog + folder come from the core (it owns MUSIC_DIR), the
+    # bytes are served from disk here (web and core share the host).
+
+    @router.get("/sounds/{key}/stream")
+    async def sound_stream(key: str):
+        try:
+            snd = await ctx.core.get("/v1/plugins/sleep/sounds")
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001 — CoreDown et al. → 503
+            raise HTTPException(
+                status_code=503, detail=f"core service unreachable: {e}"
+            )
+        match = next(
+            (s for s in snd.get("sounds", []) if s.get("key") == key), None
+        )
+        if match is None or not snd.get("dir"):
+            raise HTTPException(
+                status_code=404, detail=f"unknown sound {key!r}"
+            )
+        # Containment: user-dropped filenames come from a directory scan,
+        # but never trust a path that leaves the sounds folder.
+        root = Path(snd["dir"]).resolve(strict=False)
+        target = (root / match.get("filename", "")).resolve(strict=False)
+        try:
+            target.relative_to(root)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="path escapes the sounds folder"
+            )
+        if not target.is_file():
+            raise HTTPException(
+                status_code=409,
+                detail=f"sound file missing on disk: {target.name}",
+            )
+        media_type = _AUDIO_TYPES.get(
+            target.suffix.lower(), "application/octet-stream"
+        )
+        return FileResponse(str(target), media_type=media_type)
 
     return router
 
