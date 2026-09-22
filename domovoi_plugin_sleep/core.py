@@ -195,6 +195,14 @@ def _build_core_router(sdk: PluginSDK) -> APIRouter:
     @router.post("/stop")
     @open_endpoint
     async def stop(body: StopBody):
+        """Stop the sleep sound this plugin started. A room with no
+        sleep session is a 404 and its playback is left alone — the
+        voice path checks the same thing before it speaks."""
+        if await sessions.active_session(sdk, body.room_id) is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no sleep sound is playing in {body.room_id}",
+            )
         await sessions.stop(sdk, body.room_id, fade=body.fade)
         return {"ok": True, "room_id": body.room_id}
 

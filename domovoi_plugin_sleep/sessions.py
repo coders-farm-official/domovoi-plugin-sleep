@@ -56,6 +56,24 @@ async def active_sessions(sdk: PluginSDK) -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+async def active_session(sdk: PluginSDK, room_id: str) -> dict[str, Any] | None:
+    """The room's live sleep session, or None when this plugin is not
+    the one playing there. Callers use it to leave other playback
+    alone."""
+    async with sdk.db.session_scope() as s:
+        row = (
+            await s.execute(
+                text(
+                    f"SELECT room_id, sound_key, title, mpd_uri, started_at, "
+                    f"stop_at, active FROM {SCHEMA}.sleep_sessions "
+                    "WHERE room_id = :room AND active"
+                ),
+                {"room": room_id},
+            )
+        ).mappings().first()
+        return dict(row) if row else None
+
+
 async def _upsert_session(
     sdk: PluginSDK,
     *,

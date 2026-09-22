@@ -78,6 +78,10 @@ zero-licensing story stays intact.
   on (someone played music, the file ended, the room was stopped some
   other way), the session row deactivates so the dashboard and voice
   status never lie.
+* Stopping only ever stops **this plugin's** sound: asking a room with
+  no sleep session to stop answers `404` and leaves whatever is playing
+  there playing, the same answer the voice path gives ("No sleep sounds
+  are playing in the kitchen").
 * "Sounds" phrasings are fenced off by the trailing noun: "play ocean
   **sounds**" is this plugin at band 275; "play the beatles" still
   belongs to the music handler at 300; "play 97.5 fm" still belongs to
