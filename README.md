@@ -43,8 +43,8 @@ Dashboard → **Plugins** → install, then either:
 
 Requirements: `ffmpeg` on PATH (Domovoi installs already have it — the
 radio plugin requires it too) and `numpy` (pinned to the exact version
-the bundled radio plugin already ships, so nothing new actually
-installs). **No network.**
+in Domovoi's core `requirements.lock`, which the bundled radio plugin
+pins too, so nothing new actually installs). **No network.**
 
 First start renders the eleven sound files (a few minutes, one-time);
 the voice handler and Sleep tab answer honestly until they're ready.

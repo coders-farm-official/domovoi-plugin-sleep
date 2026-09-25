@@ -7,7 +7,7 @@
 [plugin]
 slug = "sleep"
 name = "Sleep Sounds"
-version = "1.2.1"
+version = "1.2.2"
 publisher = "Coders Farm"
 license = "MIT"
 description = "Per-room sleep sounds, synthesized locally (white / pink / brown noise, soft fan, ocean swells, plus procedurally generated rain, thunderstorm, wind, crickets, campfire, and stream) — no downloads, no accounts, works fully offline. 'Play rain sounds in the bedroom for 45 minutes' fades out and stops on its own; drop your own recordings into the sounds folder to add more."
@@ -23,9 +23,11 @@ provides = ["now-playing-source:sleep", "now-playing-matcher"]
 
 [requirements]
 # numpy powers the procedural natural-sounds pack (rain, storm, wind,
-# crickets, campfire, stream) — same pin as the bundled radio plugin,
-# so the dist is already present on any standard install (refcounted).
-python = ["numpy==2.4.4"]
+# crickets, campfire, stream) — same pin as Domovoi's core
+# requirements.lock and the bundled radio plugin, so the dist is already
+# present on any standard install (refcounted). A different version would
+# fail the install dry-run with requirements_conflict.
+python = ["numpy==2.4.6"]
 lockfile = "requirements.lock"
 system = [
   { tool = "ffmpeg", required = true, help = "Sounds are generated locally (ffmpeg noise synthesis + numpy DSP; no downloads). Core installs already need ffmpeg for the radio plugin; install from ffmpeg.org and put it on PATH." },
