@@ -25,8 +25,8 @@ provides = ["now-playing-source:sleep", "now-playing-matcher"]
 [requirements]
 # numpy powers the procedural natural-sounds pack (rain, storm, wind,
 # crickets, campfire, stream) — same pin as Domovoi's core
-# requirements.lock and the bundled radio plugin, so the dist is already
-# present on any standard install (refcounted). A different version would
+# requirements.lock, so the dist is already present on any standard
+# install (refcounted). A different version would
 # fail the install dry-run with requirements_conflict.
 python = ["numpy==2.4.6"]
 lockfile = "requirements.lock"
