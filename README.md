@@ -90,6 +90,13 @@ zero-licensing story stays intact.
 * Uninstall-purge removes the plugin's data; the generated files in
   your music library are yours — delete the `Ambient sounds` folder if
   you want them gone.
+* Who can do what: playing and stopping a sound, and READING the active
+  sessions (the Sleep page's overview, the core's `/state`), take a
+  paired device — the household token or an admin session. A session
+  list says which rooms have somebody asleep and until when, so since
+  1.2.4 it is no longer open to anything on the LAN. Regenerating the
+  sounds takes an admin. The sound catalog and the browser stream stay
+  open.
 
 ## Development
 

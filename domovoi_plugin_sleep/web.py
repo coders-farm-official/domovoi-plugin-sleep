@@ -71,7 +71,12 @@ def build_router(ctx: Any) -> APIRouter:
     session_scope = ctx.db_session_scope
 
     # ── Overview (the Sleep page's one fetch) ─────────────────────────
+    #
+    # Device tier (REV-14): the active sessions say which rooms have
+    # somebody asleep and until when — presence, a paired device's read.
+    # The page reads it with the household token like every other read.
     @router.get("/overview")
+    @device_endpoint
     async def overview() -> dict[str, Any]:
         """Rooms + active sessions from the DB; catalog + defaults from
         the core (its failure degrades to core_online=false with an
@@ -95,11 +100,20 @@ def build_router(ctx: Any) -> APIRouter:
             snd = await ctx.core.get("/v1/plugins/sleep/sounds")
             catalog = snd.get("sounds", [])
             generating = bool(snd.get("generating"))
-            state = await ctx.core.get("/v1/plugins/sleep/state")
-            defaults = {
-                "default_timer_min": state.get("default_timer_min"),
-                "file_length_min": state.get("file_length_min"),
-            }
+            if isinstance(snd.get("defaults"), dict):
+                defaults = {
+                    "default_timer_min": snd["defaults"].get("default_timer_min"),
+                    "file_length_min": snd["defaults"].get("file_length_min"),
+                }
+            else:
+                # A core still running the previous version (an upgrade
+                # staged for restart) has no defaults on /sounds; its
+                # /state is still open, so ask that once.
+                state = await ctx.core.get("/v1/plugins/sleep/state")
+                defaults = {
+                    "default_timer_min": state.get("default_timer_min"),
+                    "file_length_min": state.get("file_length_min"),
+                }
             if not catalog and not generating:
                 # Empty catalog with nothing running — the one state
                 # where the generator hook's failure is the page's whole

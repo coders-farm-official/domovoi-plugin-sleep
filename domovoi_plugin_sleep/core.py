@@ -15,7 +15,9 @@ Wires, in order:
 * the core HTTP router (``/v1/plugins/sleep/...``) — play/stop are
   daily-use ``device_endpoint`` actions (the household token any paired
   browser, phone or satellite sends, or an admin Bearer — the same tier
-  radio's play takes); regeneration is admin-gated.
+  radio's play takes); regeneration is admin-gated. The session read
+  (``/state``) is device tier too: it says which rooms have somebody
+  asleep and until when.
 
 Import discipline: nothing heavy — ffmpeg runs as a subprocess inside
 the hook/endpoint bodies.
@@ -170,10 +172,21 @@ def _build_core_router(sdk: PluginSDK) -> APIRouter:
             ],
             "dir": str(folder),
             "generating": sdk.state.get("regen_running", False),
+            # The page's two settings, so the dashboard's overview needs no
+            # session read to show them (``/state`` is device tier).
+            "defaults": {
+                "default_timer_min": int(sdk.config.default_timer_min),
+                "file_length_min": int(sdk.config.file_length_min),
+            },
         }
 
     @router.get("/state")
+    @device_endpoint        # who is asleep in which room, and until when
     async def sleep_state():
+        """Every active sleep session (room, sound, started_at, stop_at)
+        plus the defaults. Device tier: a session list is presence — it
+        says which rooms have somebody asleep right now — and that is a
+        paired device's read (REV-14)."""
         return {
             "sessions": [_session_payload(s) for s in await sessions.active_sessions(sdk)],
             "default_timer_min": int(sdk.config.default_timer_min),
