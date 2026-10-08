@@ -33,6 +33,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from domovoi.webkit import device_endpoint
+
 log = logging.getLogger(__name__)
 
 # Suffix → media type for the browser stream route. Matches the audio
@@ -127,16 +129,25 @@ def build_router(ctx: Any) -> APIRouter:
 
     # ── Actions (proxied to the plugin's CORE endpoints) ──────────────
     #
-    # play/stop are open on the core side (daily-use, same as voice);
-    # regenerate is admin-gated — forward the caller's credential.
+    # play/stop are household actions on BOTH hops (device tier: the
+    # household token or an admin Bearer), so a paired phone or browser
+    # can use them without the admin password, and the caller's
+    # credential is forwarded to the core route, which checks it again.
+    # regenerate is admin-gated — the same forwarding.
 
     @router.post("/play")
-    async def play(body: PlayBody) -> dict[str, Any]:
-        return await ctx.core.post("play", json=body.model_dump())
+    @device_endpoint
+    async def play(body: PlayBody, request: Request) -> dict[str, Any]:
+        return await ctx.core.post_admin(
+            "play", json=body.model_dump(), request=request
+        )
 
     @router.post("/stop")
-    async def stop(body: StopBody) -> dict[str, Any]:
-        return await ctx.core.post("stop", json=body.model_dump())
+    @device_endpoint
+    async def stop(body: StopBody, request: Request) -> dict[str, Any]:
+        return await ctx.core.post_admin(
+            "stop", json=body.model_dump(), request=request
+        )
 
     @router.post("/regenerate")
     async def regenerate(request: Request) -> dict[str, Any]:

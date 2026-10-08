@@ -139,7 +139,7 @@ def test_overview_degrades_when_core_down(web_client) -> None:
     assert body["sounds"] == []
 
 
-def test_play_and_stop_proxy_open(web_client) -> None:
+def test_play_and_stop_proxy_forwards_the_callers_credential(web_client) -> None:
     ctx, client = web_client
     resp = client.post(
         "/api/plugins/sleep/play",
@@ -150,8 +150,10 @@ def test_play_and_stop_proxy_open(web_client) -> None:
         "/api/plugins/sleep/stop", json={"room_id": "bedroom"}
     )
     assert resp.status_code == 200
+    # Device tier on both hops: the household token the caller presented
+    # rides to the core route, which checks it again.
     paths = [(p, had) for p, _, had in ctx.core.posts]
-    assert paths == [("play", False), ("stop", False)]
+    assert paths == [("play", True), ("stop", True)]
     # The play body rode through the proxy intact.
     assert ctx.core.posts[0][1]["minutes"] == 30
 

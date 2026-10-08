@@ -13,8 +13,9 @@ Wires, in order:
   honestly ("not generated yet") until it lands. Fully offline, so no
   ``requires_online``;
 * the core HTTP router (``/v1/plugins/sleep/...``) — play/stop are
-  daily-use ``open_endpoint`` actions (same posture as radio's tune);
-  regeneration is admin-gated.
+  daily-use ``device_endpoint`` actions (the household token any paired
+  browser, phone or satellite sends, or an admin Bearer — the same tier
+  radio's play takes); regeneration is admin-gated.
 
 Import discipline: nothing heavy — ffmpeg runs as a subprocess inside
 the hook/endpoint bodies.
@@ -30,7 +31,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from domovoi.sdk import PluginSDK, open_endpoint
+from domovoi.sdk import PluginSDK, device_endpoint
 
 from domovoi_plugin_sleep import SCHEMA, sessions, sounds
 from domovoi_plugin_sleep.handlers.sleep import SleepHandler
@@ -180,7 +181,7 @@ def _build_core_router(sdk: PluginSDK) -> APIRouter:
         }
 
     @router.post("/play")
-    @open_endpoint          # daily-use action, same posture as the voice path
+    @device_endpoint        # daily household action: the household token
     async def play(body: PlayBody):
         sound = sounds.resolve(sdk.config, sdk.core_config.music_dir, body.sound)
         if sound is None:
@@ -193,7 +194,7 @@ def _build_core_router(sdk: PluginSDK) -> APIRouter:
         return {"ok": True, "room_id": body.room_id, "sound": sound.key}
 
     @router.post("/stop")
-    @open_endpoint
+    @device_endpoint
     async def stop(body: StopBody):
         """Stop the sleep sound this plugin started. A room with no
         sleep session is a 404 and its playback is left alone — the
