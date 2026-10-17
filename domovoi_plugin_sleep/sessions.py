@@ -169,6 +169,37 @@ async def stop(sdk: PluginSDK, room_id: str, *, fade: bool = True) -> Response:
     return resp
 
 
+async def deliver(sdk: PluginSDK, resp: Response, room_id: str) -> bool:
+    """Tell the room's satellite about a start or stop that did NOT come
+    from a voice turn: the page's play / stop buttons and the timer.
+
+    ``play_url`` leaves the room's player paused for the satellite's
+    music_start -> music_ready handshake; a voice turn's socket sends
+    that, an HTTP route or a worker has none, so the page said "playing"
+    while the room stayed silent and a timer's stop never reached the
+    satellite (plugin board F-P017). The core's SDK 1.6
+    ``playback.dispatch`` delivers it the way the dashboard's room
+    controls do. An older core has no dispatch: nothing is sent, as
+    before. Never call this for a voice handler's Response — the turn
+    delivers that one itself."""
+    dispatch = getattr(sdk.playback, "dispatch", None)
+    if dispatch is None:
+        log.info(
+            "sleep: this core can't tell room=%s's satellite (no "
+            "playback.dispatch before SDK 1.6); the room may stay %s",
+            room_id, "silent" if resp.music_action == "start" else "playing",
+        )
+        return False
+    try:
+        return bool(await dispatch(resp, room_id))
+    except Exception as e:  # noqa: BLE001 — the session row is already right
+        log.warning(
+            "sleep: telling room=%s's satellite (%s) failed: %s",
+            room_id, resp.music_action, e,
+        )
+        return False
+
+
 async def _fade_down(sdk: PluginSDK, room_id: str, fade_sec: float) -> None:
     """Ramp the room's software mixer down over ``fade_sec`` in a few
     steps. The pre-fade level is restored by ``_restore_volume`` right
@@ -213,7 +244,7 @@ async def enforce(sdk: PluginSDK) -> None:
             due_at = stop_at - timedelta(seconds=fade_sec)
             if _now() >= due_at:
                 log.info("sleep: timer elapsed for room=%s", room_id)
-                await stop(sdk, room_id, fade=True)
+                await deliver(sdk, await stop(sdk, room_id, fade=True), room_id)
                 continue
 
         # 2. Reconcile: is the room still playing OUR file? "pause" is

@@ -97,6 +97,15 @@ zero-licensing story stays intact.
   1.2.4 it is no longer open to anything on the LAN. Regenerating the
   sounds takes an admin. The sound catalog and the browser stream stay
   open.
+* A sound started from the Sleep page, and a stop from the page or the
+  timer, reach the room's satellite (since 1.2.5, on a Domovoi core
+  with plugin SDK 1.6 or later: `sdk.playback.dispatch`). On an older
+  core the room's player is queued but the satellite is never told, so
+  the room stays silent: play by voice there, or update the core.
+* While an upgrade of this plugin waits for a restart, the page says so
+  ("restart Domovoi to finish the upgrade") instead of calling the core
+  unreachable (since 1.2.5; the upgrade FROM 1.2.4 still shows the old
+  wording, because the old page is what runs until the restart).
 
 ## Development
 

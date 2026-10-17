@@ -204,6 +204,8 @@ def _build_core_router(sdk: PluginSDK) -> APIRouter:
         )
         if resp.music_action != "start":
             raise HTTPException(status_code=502, detail=resp.text)
+        # No voice turn carries this to the room: tell its satellite.
+        await sessions.deliver(sdk, resp, body.room_id)
         return {"ok": True, "room_id": body.room_id, "sound": sound.key}
 
     @router.post("/stop")
@@ -217,7 +219,8 @@ def _build_core_router(sdk: PluginSDK) -> APIRouter:
                 status_code=404,
                 detail=f"no sleep sound is playing in {body.room_id}",
             )
-        await sessions.stop(sdk, body.room_id, fade=body.fade)
+        resp = await sessions.stop(sdk, body.room_id, fade=body.fade)
+        await sessions.deliver(sdk, resp, body.room_id)
         return {"ok": True, "room_id": body.room_id}
 
     @router.post("/regenerate")
