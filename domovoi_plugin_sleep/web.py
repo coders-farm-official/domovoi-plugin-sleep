@@ -92,6 +92,7 @@ def build_router(ctx: Any) -> APIRouter:
             sessions = await _read_sessions(s)
 
         core_online = True
+        waiting_for_restart: dict[str, Any] | None = None
         catalog: list[dict[str, Any]] = []
         defaults: dict[str, Any] = {}
         generating = False
@@ -130,6 +131,11 @@ def build_router(ctx: Any) -> APIRouter:
         except Exception as e:  # noqa: BLE001 — core down is a rendered state
             log.debug("sleep overview: core fetch failed: %s", e)
             core_online = False
+            # The core may be up with this plugin's routes gone: an upgrade
+            # installed from the Plugins page waits for a restart, and until
+            # then the core serves none of the plugin (plugin board F-P026:
+            # the page said "core service unreachable" while it answered).
+            waiting_for_restart = await _pending_restart()
 
         return {
             "rooms": rooms,
@@ -139,6 +145,23 @@ def build_router(ctx: Any) -> APIRouter:
             "generator_error": generator_error,
             "defaults": defaults,
             "core_online": core_online,
+            "waiting_for_restart": waiting_for_restart,
+        }
+
+    async def _pending_restart() -> dict[str, Any] | None:
+        """``{from_version, to_version}`` when the core says this plugin
+        was upgraded and loads at the next restart, else None (including
+        when the core does not answer at all)."""
+        try:
+            status = await ctx.core.get("/v1/plugins/sleep/status")
+        except Exception:  # noqa: BLE001 — really unreachable
+            return None
+        pending = status.get("pending_restart") if isinstance(status, dict) else None
+        if not isinstance(pending, dict):
+            return None
+        return {
+            "from_version": pending.get("from_version"),
+            "to_version": pending.get("to_version") or status.get("version"),
         }
 
     # ── Actions (proxied to the plugin's CORE endpoints) ──────────────

@@ -41,10 +41,16 @@ class _RecordingCore:
         self.posts: list[tuple[str, dict | None, bool]] = []  # (path, json, had_request)
         self.sounds_payload: dict | None = None      # override for stream tests
         self.status_payload: dict = {"startup_hooks": []}
+        self.plugin_routes_gone = False
 
     async def get(self, path: str, *, params=None):
         if self.fail:
             raise RuntimeError("core service unreachable")
+        if self.plugin_routes_gone and not path.endswith("/status"):
+            # An upgrade staged for restart: the core answers, but none
+            # of this plugin's routes are mounted until the restart.
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Not Found")
         if path.endswith("/sounds"):
             return self.sounds_payload or {
                 "sounds": [{"key": "brown noise", "title": "Brown noise",
@@ -137,6 +143,41 @@ def test_overview_degrades_when_core_down(web_client) -> None:
     assert body["core_online"] is False
     assert "bedroom" in body["rooms"]            # DB half still renders
     assert body["sounds"] == []
+
+
+@requires_db
+def test_overview_says_an_upgrade_waits_for_a_restart(web_client) -> None:
+    """F-P026: after "I trust this publisher — upgrade" the core unloads the
+    plugin until a restart; its routes 404 while the core itself answers.
+    The page said "core service unreachable". The overview now reports the
+    staged upgrade so the page can say "restart to finish the upgrade"."""
+    import asyncio
+    asyncio.run(_seed())
+
+    ctx, client = web_client
+    ctx.core.plugin_routes_gone = True
+    ctx.core.status_payload = {
+        "slug": "sleep", "version": "1.2.6", "startup_hooks": [],
+        "pending_restart": {"slug": "sleep", "from_version": "1.2.5",
+                            "to_version": "1.2.6", "since": "2026-10-17T03:00:00Z",
+                            "where": ["core"]},
+    }
+    body = client.get("/api/plugins/sleep/overview").json()
+    assert body["core_online"] is False            # its controls stay off
+    assert body["waiting_for_restart"] == {"from_version": "1.2.5", "to_version": "1.2.6"}
+    assert "bedroom" in body["rooms"]
+
+
+@requires_db
+def test_a_core_that_does_not_answer_is_still_unreachable(web_client) -> None:
+    import asyncio
+    asyncio.run(_seed())
+
+    ctx, client = web_client
+    ctx.core.fail = True
+    body = client.get("/api/plugins/sleep/overview").json()
+    assert body["core_online"] is False
+    assert body["waiting_for_restart"] is None
 
 
 def test_play_and_stop_proxy_forwards_the_callers_credential(web_client) -> None:

@@ -276,7 +276,10 @@ const SleepPage = () => {
       {overview && overview.core_online === false && (
         <Card>
           <div style={{ padding: '10px 16px', fontSize: 12, color: 'var(--warn)' }}>
-            core service unreachable — controls are disabled until it's back
+            {overview.waiting_for_restart
+              ? `Sleep ${overview.waiting_for_restart.to_version || ''} is installed — restart `
+                + 'Domovoi to finish the upgrade (Plugins page). Controls are off until then.'
+              : "core service unreachable — controls are disabled until it's back"}
           </div>
         </Card>
       )}
