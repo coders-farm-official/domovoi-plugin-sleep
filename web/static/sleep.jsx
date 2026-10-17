@@ -275,7 +275,7 @@ const SleepPage = () => {
 
       {overview && overview.core_online === false && (
         <Card>
-          <div style={{ padding: '10px 16px', fontSize: 12, color: 'var(--warn)' }}>
+          <div style={{ padding: '10px 16px', fontSize: 12, color: 'var(--warn-ink, var(--warn))' }}>
             {overview.waiting_for_restart
               ? `Sleep ${overview.waiting_for_restart.to_version || ''} is installed — restart `
                 + 'Domovoi to finish the upgrade (Plugins page). Controls are off until then.'
@@ -294,7 +294,7 @@ const SleepPage = () => {
         && sounds.length === 0 && overview.generator_error && (
         <Card>
           <div style={{ padding: '10px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <div style={{ fontSize: 12, color: 'var(--warn)' }}>
+            <div style={{ fontSize: 12, color: 'var(--warn-ink, var(--warn))' }}>
               sound generation failed — no files were rendered
             </div>
             <div className="mono" style={{ fontSize: 11, color: 'var(--fg-muted)',
