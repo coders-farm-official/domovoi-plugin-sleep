@@ -60,6 +60,32 @@ class StopBody(BaseModel):
     fade: bool = False
 
 
+class StoryBody(BaseModel):
+    room_id: str | None = Field(default=None, min_length=1)
+    size: str | None = None
+    minutes: int | None = Field(default=None, ge=1, le=180)
+    premise: str = Field(default="", max_length=500)
+    tone: str = "cozy"
+    audience: str = "kids"
+    bed_sound: str | None = None
+
+
+class IdeasBody(BaseModel):
+    tone: str = "cozy"
+    audience: str = "kids"
+    hint: str = Field(default="", max_length=200)
+
+# The story sizes (stories.SIZES — this process can't import the core
+# side's modules, so the page's copy lives here).
+STORY_SIZES = [
+    {"key": "s", "label": "S", "minutes": 3},
+    {"key": "m", "label": "M", "minutes": 10},
+    {"key": "l", "label": "L", "minutes": 20},
+    {"key": "xl", "label": "XL", "minutes": 40},
+    {"key": "huge", "label": "Huge", "minutes": 90},
+]
+
+
 def register_web(ctx: Any) -> None:
     ctx.add_router(build_router(ctx))
 
@@ -90,6 +116,7 @@ def build_router(ctx: Any) -> APIRouter:
                 ).all()
             ]
             sessions = await _read_sessions(s)
+            room_stories = await _read_room_stories(s)
 
         core_online = True
         waiting_for_restart: dict[str, Any] | None = None
@@ -140,6 +167,8 @@ def build_router(ctx: Any) -> APIRouter:
         return {
             "rooms": rooms,
             "sessions": sessions,
+            "stories": room_stories,
+            "story_sizes": STORY_SIZES,
             "sounds": catalog,
             "generating": generating,
             "generator_error": generator_error,
@@ -185,6 +214,108 @@ def build_router(ctx: Any) -> APIRouter:
         return await ctx.core.post_admin(
             "stop", json=body.model_dump(), request=request
         )
+
+    # ── Storytime ─────────────────────────────────────────────────────
+
+    @router.post("/stories")
+    @device_endpoint
+    async def story_start(body: StoryBody, request: Request) -> dict[str, Any]:
+        return await ctx.core.post_admin(
+            "stories", json=body.model_dump(), request=request
+        )
+
+    @router.post("/stories/ideas")
+    @device_endpoint
+    async def story_ideas(body: IdeasBody, request: Request) -> dict[str, Any]:
+        return await ctx.core.post_admin(
+            "stories/ideas", json=body.model_dump(), request=request
+        )
+
+    @router.post("/stories/{story_id}/stop")
+    @device_endpoint
+    async def story_stop(story_id: int, request: Request) -> dict[str, Any]:
+        return await ctx.core.post_admin(f"stories/{story_id}/stop", request=request)
+
+    @router.get("/stories/{story_id}")
+    @device_endpoint
+    async def story_read(story_id: int) -> dict[str, Any]:
+        """A story's state and its passages so far. A browser playing the
+        story polls this; the read is its heartbeat (the writer stops a
+        browser story nobody polls)."""
+        async with session_scope() as s:
+            row = (
+                await s.execute(
+                    text(
+                        "SELECT id, room_id, title, premise, minutes, bed_sound, "
+                        "status, writing_done, segments, audio_sec, error, created_at "
+                        "FROM stories WHERE id = :id"
+                    ),
+                    {"id": story_id},
+                )
+            ).mappings().first()
+            if row is None:
+                raise HTTPException(status_code=404, detail="no such story")
+            if row["room_id"] is None and row["status"] in ("writing", "playing"):
+                await s.execute(
+                    text("UPDATE stories SET last_seen_at = NOW() WHERE id = :id"),
+                    {"id": story_id},
+                )
+            segs = (
+                await s.execute(
+                    text(
+                        "SELECT n, duration_sec FROM story_segments "
+                        "WHERE story_id = :id ORDER BY n"
+                    ),
+                    {"id": story_id},
+                )
+            ).mappings().all()
+        return {
+            "story": _isoformat(dict(row)),
+            "segments": [
+                {
+                    "n": g["n"],
+                    "duration_sec": g["duration_sec"],
+                    "src": f"/api/plugins/sleep/stories/{story_id}/segments/{g['n']}/stream",
+                }
+                for g in segs
+            ],
+        }
+
+    @router.get("/stories/{story_id}/segments/{n}/stream")
+    async def story_segment_stream(story_id: int, n: int):
+        """One passage's audio for the browser player (the same posture as
+        the sounds' stream route: a local file, served from disk)."""
+        async with session_scope() as s:
+            filename = (
+                await s.execute(
+                    text(
+                        "SELECT filename FROM story_segments "
+                        "WHERE story_id = :id AND n = :n"
+                    ),
+                    {"id": story_id, "n": n},
+                )
+            ).scalar()
+        if not filename:
+            raise HTTPException(status_code=404, detail="no such passage")
+        try:
+            snd = await ctx.core.get("/v1/plugins/sleep/sounds")
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001 — CoreDown et al. → 503
+            raise HTTPException(
+                status_code=503, detail=f"core service unreachable: {e}"
+            )
+        if not snd.get("dir"):
+            raise HTTPException(status_code=503, detail="no sounds folder")
+        root = (Path(snd["dir"]) / "Stories").resolve(strict=False)
+        target = (root / filename).resolve(strict=False)
+        try:
+            target.relative_to(root)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="path escapes the stories folder")
+        if not target.is_file():
+            raise HTTPException(status_code=410, detail="that passage was tidied away")
+        return FileResponse(str(target), media_type="audio/ogg")
 
     @router.post("/regenerate")
     async def regenerate(request: Request) -> dict[str, Any]:
@@ -259,6 +390,29 @@ async def _read_sessions(session: AsyncSession) -> list[dict[str, Any]]:
     return out
 
 
+def _isoformat(d: dict[str, Any]) -> dict[str, Any]:
+    return {k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in d.items()}
+
+
+async def _read_room_stories(session: AsyncSession) -> list[dict[str, Any]]:
+    """Live stories that belong to a room (a browser story is its own
+    page's business), so a room card can say "writing…" before the
+    first passage reaches the room."""
+    rows = (
+        await session.execute(
+            text(
+                "SELECT id, room_id, title, premise, minutes, status, "
+                "writing_done, segments, audio_sec, error, created_at "
+                "FROM stories WHERE room_id IS NOT NULL "
+                "AND (status IN ('writing', 'playing') "
+                "     OR (status = 'failed' AND updated_at > NOW() - INTERVAL '10 minutes')) "
+                "ORDER BY id"
+            )
+        )
+    ).mappings().all()
+    return [_isoformat(dict(r)) for r in rows]
+
+
 # ─── Realtime snapshot (manifest [[realtime]] wiring) ────────────────────
 #
 # Broadcast VERBATIM on ``sleep.sessions``. stop_at is a fixed timestamp
@@ -267,7 +421,12 @@ async def _read_sessions(session: AsyncSession) -> list[dict[str, Any]]:
 
 
 async def snapshot_sessions(session: AsyncSession) -> dict[str, Any]:
-    return {"sessions": await _read_sessions(session)}
+    # Room stories ride along so a card's "writing…" turns into the story
+    # (or its failure) without a reload.
+    return {
+        "sessions": await _read_sessions(session),
+        "stories": await _read_room_stories(session),
+    }
 
 
 SNAPSHOTS = {

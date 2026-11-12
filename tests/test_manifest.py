@@ -38,6 +38,7 @@ def test_manifest_parses_and_declares_the_contract():
     assert kinds == {
         "sleep_timer": "poll",
         "sleep_generator": "startup",
+        "story_writer": "poll",
     }
 
     # Realtime channel is namespaced and maps to the declared snapshot.

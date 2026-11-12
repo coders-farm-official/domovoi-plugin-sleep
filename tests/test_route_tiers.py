@@ -40,12 +40,22 @@ CORE_TIERS = {
     ("GET", "/state"): "device",
     ("POST", "/play"): "device",
     ("POST", "/stop"): "device",
+    ("POST", "/stories"): "device",
+    ("POST", "/stories/ideas"): "device",
+    ("POST", "/stories/{story_id}/stop"): "device",
     ("POST", "/regenerate"): "admin",
 }
 WEB_TIERS = {
     ("GET", "/overview"): "device",
     ("POST", "/play"): "device",
     ("POST", "/stop"): "device",
+    # Storytime: starting, stopping and the ideas are household actions;
+    # a story's read says what a room is listening to (and heartbeats a
+    # browser story). The passage stream is an open read like the sounds'.
+    ("POST", "/stories"): "device",
+    ("POST", "/stories/ideas"): "device",
+    ("POST", "/stories/{story_id}/stop"): "device",
+    ("GET", "/stories/{story_id}"): "device",
     ("POST", "/regenerate"): "admin",
 }
 

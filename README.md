@@ -34,6 +34,33 @@ runs independently through its own player.
   voice-addressable by its filename: `rain on tent.mp3` → *"play rain
   on tent sounds"*.
 
+## Storytime
+
+> "tell a huge bedtime story about a dragon who lost his blanket in the kids room"
+
+An AI bedtime story that runs for as long as you ask. The house's own Q&A
+model (Ollama, on the Domovoi server) writes it a passage at a time while
+it plays, staying a few minutes ahead of the listener, and each passage
+is read in **the room's own voice** (a browser gets the server's voice).
+Near the end the story slows down, and it lands a sleepy ending on time.
+
+* **Lengths** — S 3 min · M 10 · L 20 · XL 40 · Huge 90, or any number
+  of minutes (1–180). By voice: "a small / medium / long / extra long /
+  huge story", "a 25 minute bedtime story", "tell me a story about otters
+  for 20 minutes". Plain "tell me a story" (or "a short story") stays a
+  quick one from the Q&A model; a size, a length or "bedtime" makes it
+  Storytime. "Stop the story" ends it, as does "stop the sounds".
+* **The Sleep page** — a Storytime card: what it's about (or *surprise
+  me* for three ideas to pick from), length, tone (cozy, silly,
+  adventure, magical, calm), who's listening (kids, grown-ups), an
+  optional sleep sound underneath, and the room — or this browser.
+* **A sleep sound underneath** — mixed under the voice, and it keeps
+  playing after the story ends until the default sleep timer runs out.
+* **Needs** Domovoi 1.9+ (SDK `speech.render`) and the household's AI
+  features on. Nothing leaves the machine. Passages are written next to
+  the sleep sounds (`Ambient sounds/Stories/`) and deleted 12 hours after
+  the story ends.
+
 ## Install
 
 Dashboard → **Plugins** → install, then either:
@@ -67,6 +94,8 @@ zero-licensing story stays intact.
 | Default sleep timer | `45` min | Used when no duration is spoken. 0 = play to file end. |
 | Fade-out | `20` s | Volume ramp before a timed stop. |
 | Stereo | off | Satellites are mono speakers; stereo doubles disk. |
+| Storytime | on | The story writer worker. Stories need the household's AI features on too. |
+| Story writer tick | `5` s | How often the writer checks whether a story needs its next passage. |
 
 ## How it behaves
 

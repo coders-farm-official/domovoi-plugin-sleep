@@ -6,6 +6,12 @@
   * "play sleep sounds" — the default sound (brown noise)
   * "stop the sounds" / "stop the white noise in the bedroom"
   * "what sounds can you play" — read the catalog
+  * Storytime: "tell me a bedtime story about a sleepy dragon", "tell a
+    huge story in the kids room", "tell me a story about otters for 20
+    minutes", "a 15 minute story" — an AI story that runs that long
+    (stories.py); "stop the story". A bare "tell me a story" is left to
+    the Q&A model, which tells a short one: only a size, a length or
+    "bedtime" makes it Storytime.
 
 Every play pattern is anchored on a trailing "sounds/noise" noun —
 that's the fence against MusicHandler's greedy ``^play (.+)$`` at 300
@@ -47,7 +53,7 @@ from domovoi.sdk import (
     Response,
 )
 
-from domovoi_plugin_sleep import sessions, sounds
+from domovoi_plugin_sleep import sessions, sounds, stories
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +80,38 @@ _LIST_RE = re.compile(
 
 DEFAULT_SOUND_KEY = "brown noise"
 
+# ── Storytime ────────────────────────────────────────────────────────────
+_SIZE_WORDS = "|".join(
+    sorted((re.escape(w) for w in stories.SIZE_WORDS
+            if w not in stories.CASUAL_SIZE_WORDS), key=len, reverse=True)
+)
+_CASUAL_WORDS = "|".join(stories.CASUAL_SIZE_WORDS)
+_TELL = (
+    r"^(?:(?:can you |could you |will you |would you |please )?"
+    r"(?:tell|read|play)(?: me| us| the kids| them| him| her)? )?"
+    r"(?:a |an |another )?"
+)
+_ABOUT = r"(?: (?:about|where|with) (?P<about>.+?))?"
+_KIND = r"(?:(?:bedtime|sleepy|sleep|night ?time|good ?night) )"
+# "tell me a huge bedtime story about otters in the bedroom",
+# "a 20 minute story", "tell me a bedtime story" — sized or bedtime.
+_STORY_SIZED_RE = re.compile(
+    _TELL
+    + rf"(?:(?P<size>{_SIZE_WORDS}) {_KIND}?"
+    + rf"|(?P<casual>{_CASUAL_WORDS}) {_KIND}"
+    + r"|(?P<num2>\d+)[ -](?P<unit2>minute|min|hour)s? (?:long )?"
+    + rf"{_KIND}?|{_KIND})"
+    + rf"story(?: for (?:the )?(?:kids|me|us))?{_ABOUT}{_ROOM}{_TIMER}(?: please)?$"
+)
+# "tell me a story about otters for 20 minutes" — a length makes it ours.
+_STORY_TIMED_RE = re.compile(
+    _TELL + rf"story{_ABOUT}{_ROOM}"
+    + r" for (?P<num>\d+) (?P<unit>minutes?|mins?|hours?|hrs?)(?: please)?$"
+)
+_STOP_STORY_RE = re.compile(
+    rf"^(?:stop|end|cancel) (?:the |this |that )?(?:bedtime )?story{_ROOM}$"
+)
+
 
 class SleepHandler(Handler):
     name = "sleep"
@@ -90,14 +128,28 @@ class SleepHandler(Handler):
             "noise, a soft fan, ocean waves, plus any custom sounds the "
             "household added) in a room, with an automatic sleep timer "
             "and fade-out. Also stops them and lists what's available. "
-            "Example: 'play brown noise in the bedroom for 30 minutes'."
+            "Also tells AI bedtime stories that run for a chosen length "
+            "(action=story; only when a length, size or 'bedtime' is "
+            "asked for). "
+            "Example: 'play brown noise in the bedroom for 30 minutes', "
+            "'tell a huge bedtime story about otters in the kids room'."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["play", "stop", "list"],
+                    "enum": ["play", "stop", "list", "story", "stop_story"],
+                },
+                "size": {
+                    "type": "string",
+                    "enum": ["s", "m", "l", "xl", "huge"],
+                    "description": "Story length when action=story: s=3, "
+                                   "m=10, l=20, xl=40, huge=90 minutes.",
+                },
+                "about": {
+                    "type": "string",
+                    "description": "What the story is about when action=story.",
                 },
                 "sound": {
                     "type": "string",
@@ -109,7 +161,8 @@ class SleepHandler(Handler):
                 },
                 "minutes": {
                     "type": "integer",
-                    "description": "Sleep timer in minutes; 0 plays to the end.",
+                    "description": "Sleep timer in minutes; 0 plays to the end. "
+                                   "For action=story, the story's length.",
                 },
             },
             "required": ["action"],
@@ -123,6 +176,9 @@ class SleepHandler(Handler):
             FastPath(_PLAY_RE, SleepHandler._play_from_match),
             FastPath(_STOP_RE, SleepHandler._stop_from_match),
             FastPath(_LIST_RE, SleepHandler._list_from_match),
+            FastPath(_STORY_SIZED_RE, SleepHandler._story_from_match),
+            FastPath(_STORY_TIMED_RE, SleepHandler._story_from_match),
+            FastPath(_STOP_STORY_RE, SleepHandler._stop_story_from_match),
         ]
 
     # ─── Fast-path adapters ─────────────────────────────────────────────
@@ -149,6 +205,22 @@ class SleepHandler(Handler):
     async def _list_from_match(self, m, ctx, session):
         return self._list(ctx)
 
+    async def _story_from_match(self, m, ctx, session):
+        groups = m.groupdict()
+        minutes = _parse_minutes(groups.get("num"), groups.get("unit"))
+        if minutes is None and groups.get("num2"):
+            minutes = _parse_minutes(groups["num2"], groups.get("unit2"))
+        return await self._story(
+            ctx, session,
+            size=groups.get("size") or groups.get("casual"),
+            minutes=minutes,
+            about=groups.get("about"),
+            spoken_room=groups.get("room"),
+        )
+
+    async def _stop_story_from_match(self, m, ctx, session):
+        return await self._stop_story(ctx, session, spoken_room=m.group("room"))
+
     # ─── Entry points ───────────────────────────────────────────────────
 
     async def execute(
@@ -172,6 +244,17 @@ class SleepHandler(Handler):
             )
         if action == "stop":
             return await self._stop(ctx, session, spoken_room=args.get("room"))
+        if action == "story":
+            minutes = args.get("minutes")
+            return await self._story(
+                ctx, session,
+                size=args.get("size"),
+                minutes=int(minutes) if isinstance(minutes, int) else None,
+                about=args.get("about"),
+                spoken_room=args.get("room"),
+            )
+        if action == "stop_story":
+            return await self._stop_story(ctx, session, spoken_room=args.get("room"))
         return self._list(ctx)
 
     # ─── Actions ────────────────────────────────────────────────────────
@@ -241,6 +324,62 @@ class SleepHandler(Handler):
         resp = await sessions.stop(self.sdk, room_id, fade=False)
         resp.text = "Stopped the sounds."
         return resp
+
+    async def _story(
+        self,
+        ctx: Context,
+        session: AsyncSession,
+        *,
+        size: str | None,
+        minutes: int | None,
+        about: str | None,
+        spoken_room: str | None,
+    ) -> Response:
+        room_id, room_err = await self._resolve_room(session, ctx, spoken_room)
+        if room_id is None:
+            return self._reply(ctx, room_err.replace(
+                "play brown noise in the bedroom",
+                "tell a bedtime story in the bedroom",
+            ))
+        if minutes is None:
+            minutes = stories.size_minutes(size)
+        premise = (about or "").strip()
+        try:
+            await stories.start(
+                self.sdk, room_id=room_id, minutes=minutes, premise=premise,
+            )
+        except stories.StoryError as e:
+            return self._reply(ctx, str(e))
+        what = f"a story about {premise}" if premise else "a bedtime story"
+        return self._reply(
+            ctx,
+            f"Okay, {what}, about {_speak_minutes(minutes)} long, in the "
+            f"{_speak_room(room_id)}. It'll start in a moment.",
+        )
+
+    async def _stop_story(
+        self, ctx: Context, session: AsyncSession, *, spoken_room: str | None
+    ) -> Response:
+        room_id, room_err = await self._resolve_room(session, ctx, spoken_room)
+        if room_id is None:
+            return self._reply(ctx, room_err)
+        active = await sessions.active_session(self.sdk, room_id)
+        story_id = stories.story_id_of(active["sound_key"]) if active else None
+        live = [
+            st for st in await stories.live_stories(self.sdk)
+            if st["room_id"] == room_id
+        ]
+        if story_id is None and not live:
+            return self._reply(
+                ctx, f"No story is playing in the {_speak_room(room_id)}."
+            )
+        for st in live:
+            await stories.mark_stopped(self.sdk, st["id"])
+        if story_id is not None:
+            resp = await sessions.stop(self.sdk, room_id, fade=False)
+            resp.text = "Okay, the story's over. Goodnight."
+            return resp
+        return self._reply(ctx, "Okay, I've stopped the story.")
 
     def _list(self, ctx: Context) -> Response:
         cat = sounds.catalog(self.sdk.config, self.sdk.core_config.music_dir)

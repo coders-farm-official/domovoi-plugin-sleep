@@ -57,7 +57,9 @@ async def test_load_register_contracts_unload() -> None:
         assert any(slug == "sleep" for slug, _ in NOW_PLAYING.matchers())
 
         # Worker + startup hook registered under the owner.
-        assert WORKERS.worker_names("sleep") == {"sleep_timer": "poll"}
+        assert WORKERS.worker_names("sleep") == {
+            "sleep_timer": "poll", "story_writer": "poll",
+        }
         assert WORKERS.hook_names("sleep") == ["sleep_generator"]
 
         # Config contribution live on the SDK facade.

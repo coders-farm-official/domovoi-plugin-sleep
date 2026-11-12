@@ -82,6 +82,45 @@ async def _upsert_session(
     mpd_uri: str,
     stop_at: datetime | None,
 ) -> None:
+    await _upsert_row(
+        sdk, room_id=room_id, key=sound.key, title=sound.title,
+        mpd_uri=mpd_uri, stop_at=stop_at,
+    )
+
+
+async def start_story_session(
+    sdk: PluginSDK, *, room_id: str, key: str, title: str, mpd_uri: str,
+) -> None:
+    """A story started in ``room_id`` (stories.py): the same session row
+    a sound gets, so stop, the fade and the page all work on it. No timer
+    — the story ends when its last passage does (or, with a sleep sound
+    under it, ``set_stop_at`` sets one then)."""
+    await _upsert_row(
+        sdk, room_id=room_id, key=key, title=title, mpd_uri=mpd_uri, stop_at=None,
+    )
+
+
+async def set_stop_at(sdk: PluginSDK, room_id: str, stop_at: datetime | None) -> None:
+    async with sdk.db.session_scope() as s:
+        await s.execute(
+            text(
+                f"UPDATE {SCHEMA}.sleep_sessions SET stop_at = :stop_at, "
+                "updated_at = NOW() WHERE room_id = :room AND active"
+            ),
+            {"room": room_id, "stop_at": stop_at},
+        )
+        await sdk.realtime.notify(s, "sessions_changed", "timer")
+
+
+async def _upsert_row(
+    sdk: PluginSDK,
+    *,
+    room_id: str,
+    key: str,
+    title: str,
+    mpd_uri: str,
+    stop_at: datetime | None,
+) -> None:
     async with sdk.db.session_scope() as s:
         await s.execute(
             text(
@@ -96,7 +135,7 @@ async def _upsert_session(
                     active = TRUE, updated_at = NOW()
                 """
             ),
-            {"room": room_id, "key": sound.key, "title": sound.title,
+            {"room": room_id, "key": key, "title": title,
              "uri": mpd_uri, "stop_at": stop_at},
         )
         await sdk.realtime.notify(s, "sessions_changed", "started")
@@ -257,7 +296,36 @@ async def enforce(sdk: PluginSDK) -> None:
         except Exception as e:  # noqa: BLE001 — player unreachable ≠ session over
             log.debug("sleep: reconcile skip room=%s: %s", room_id, e)
             continue
+        if await _story_still_playing(sdk, session, state, current):
+            continue
         if state == "stop" or current.get("file") != session["mpd_uri"]:
             # File ended on its own, or something else took the room.
             sdk.now_playing.clear(room_id, source=NOW_PLAYING_SOURCE)
             await _deactivate(sdk, room_id, "ended")
+
+
+async def _story_still_playing(
+    sdk: PluginSDK, session: dict[str, Any], state: str, current: dict[str, Any]
+) -> bool:
+    """A story session plays many files: any of its passages, or the
+    sleep sound queued after its ending, still counts. A room that ran
+    dry while the next passage is being written is waiting, not done.
+    False for a sound's session (the caller's own check applies)."""
+    from domovoi_plugin_sleep import stories   # stories imports this module
+
+    story_id = stories.story_id_of(session["sound_key"])
+    if story_id is None:
+        return False
+    story = await stories.get(sdk, story_id)
+    if story is None or story["status"] not in stories.LIVE:
+        return False
+    if state == "stop":
+        return not story["writing_done"]
+    playing = current.get("file") or ""
+    if playing.startswith(stories.story_uri_prefix(sdk.config, story_id)):
+        return True
+    if story["bed_sound"]:
+        bed = sounds.resolve(sdk.config, sdk.core_config.music_dir, story["bed_sound"])
+        if bed is not None and playing == sounds.mpd_uri(sdk.config, bed):
+            return True
+    return False

@@ -41,6 +41,12 @@ class SleepSettings(BaseSettings):
     timer_interval_sec: float = 5.0
     timer_enabled: bool = True
 
+    # ── Storytime ───────────────────────────────────────────────────────
+    # The writer worker: writes stories a passage at a time with the
+    # house's Q&A model, staying a few minutes ahead of the listener.
+    story_enabled: bool = True
+    story_interval_sec: float = 5.0
+
 
 SLEEP_FIELDSPECS: list[FieldSpec] = [
     FieldSpec(
@@ -83,5 +89,18 @@ SLEEP_FIELDSPECS: list[FieldSpec] = [
         name="timer_interval_sec", label="Timer tick (seconds)",
         help="How often timers are checked.",
         group="Timers", kind="float",
+    ),
+    FieldSpec(
+        name="story_enabled", label="Storytime",
+        help="AI bedtime stories that run as long as you ask, written by "
+             "the house's Q&A model and read in the room's voice. Needs "
+             "the AI features on.",
+        group="Storytime", kind="bool", tier="restart",
+    ),
+    FieldSpec(
+        name="story_interval_sec", label="Story writer tick (seconds)",
+        help="How often the writer checks whether a story needs its next "
+             "passage.",
+        group="Storytime", kind="float",
     ),
 ]

@@ -131,6 +131,14 @@ class FakeMPDClient:
     async def current_song(self) -> dict | None:
         return self._current
 
+    # Storytime: passages are indexed, then appended to the queue.
+    async def update_paths(self, uris: list[str]) -> None:
+        self.updated = getattr(self, "updated", []) + list(uris)
+
+    async def queue_add_tracks(self, specs: list[dict]) -> list[dict]:
+        self.appended = getattr(self, "appended", []) + [s["file_path"] for s in specs]
+        return [{"file": s["file_path"], "id": 1} for s in specs]
+
 
 class RecordingNowPlaying:
     def __init__(self) -> None:
@@ -193,6 +201,7 @@ async def live_sdk(tmp_path):
 
     async with engine.begin() as conn:
         await conn.execute(text("TRUNCATE plugin_sleep.sleep_sessions"))
+        await conn.execute(text("TRUNCATE plugin_sleep.stories CASCADE"))
 
     sdk = build_sdk("sleep", version="1.0.0", data_dir=tmp_path / "data")
     sdk.config = make_settings()

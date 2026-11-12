@@ -10,6 +10,9 @@
  *   * GET  /api/plugins/sleep/overview      — rooms, sessions, catalog
  *   * POST /api/plugins/sleep/play|stop     — open (daily-use)
  *   * POST /api/plugins/sleep/regenerate    — admin
+ *   * POST /api/plugins/sleep/stories[/ideas|/{id}/stop] — Storytime
+ *   * GET  /api/plugins/sleep/stories/{id}  — a browser story's passages
+ *     (and its heartbeat)
  *   * GET  /api/plugins/sleep/sounds/{key}/stream — browser playback
  *     (the manifest's [[web.player_sources]] route, via usePlayback)
  *   * /ws/state · `sleep.sessions.changed`  — live refetch nudge
@@ -20,7 +23,7 @@
  *
  * Core-bundle globals used (loaded before any plugin script): React,
  * Card, Button, Icon, Pill, Empty, PageHeader, RoomChip, useToast,
- * apiPost, useApiObject, usePlayback.
+ * apiGet, apiPost, useApiObject, usePlayback.
  */
 
 const SLEEP_API = '/api/plugins/sleep';
@@ -78,6 +81,7 @@ const RoomCard = ({ room, session, sounds, defaults, busy, onPlay, onStop, nowMs
     ? (defaults.default_timer_min ?? 45)
     : minutes;
   const remaining = session ? countdownTo(session.stop_at, nowMs) : null;
+  const isStory = !!(session && String(session.sound_key || '').startsWith('story:'));
 
   return (
     <Card>
@@ -86,10 +90,10 @@ const RoomCard = ({ room, session, sounds, defaults, busy, onPlay, onStop, nowMs
           <RoomChip name={room} online={!!session}/>
           {session ? (
             <>
-              <Pill tone="brand" live>playing</Pill>
+              <Pill tone="brand" live>{isStory ? 'story' : 'playing'}</Pill>
               <span style={{ fontSize: 13, fontWeight: 500 }}>{session.title}</span>
               <span className="mono" style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--fg-muted)' }}>
-                {remaining ? `${remaining} left` : 'to file end'}
+                {remaining ? `${remaining} left` : (isStory ? 'until the end' : 'to file end')}
               </span>
             </>
           ) : (
@@ -190,6 +194,335 @@ const BrowserPlayCard = ({ sounds, defaults, fire }) => {
                   onClick={() => setMinutes(0)}>
             file end
           </button>
+        </div>
+      </div>
+    </Card>
+  );
+};
+
+/* ---- Storytime ----------------------------------------------------- */
+/* An AI bedtime story that runs as long as asked. A room story is
+ * written, voiced in that room's voice and queued in the room by the
+ * core's writer; a browser story is voiced in the server's voice and
+ * `storyPoller` feeds its passages to the dashboard player as they land
+ * (polling GET /stories/{id}, which is also its heartbeat). The poller
+ * lives outside the page, so the story keeps coming while you browse
+ * elsewhere in the dashboard; the player is app-level too. */
+const STORY_TONES = ['cozy', 'silly', 'adventure', 'magical', 'calm'];
+const STORY_AUDIENCES = [['kids', 'kids'], ['grown-ups', 'grown-ups']];
+const STORY_POLL_MS = 5000;
+const BROWSER_TARGET = '__browser__';
+
+const storyQueueItem = (story, seg) => ({
+  uid: `story-${story.id}-${seg.n}`,
+  kind: 'sleep',
+  trackId: null,
+  title: story.title || 'Bedtime story',
+  artist: 'Domovoi storytime',
+  album: '',
+  src: seg.src,
+  coverUrl: null,
+  durationSec: seg.duration_sec || null,
+  seekable: true,
+  cacheable: false,
+  meta: { story: story.id, part: seg.n },
+});
+
+const storyStatusWords = (st) => {
+  if (!st) return '';
+  if (st.status === 'writing') return 'writing the first part…';
+  if (st.status === 'playing') return st.writing_done ? 'ending written' : 'telling';
+  if (st.status === 'failed') return `couldn't write it${st.error ? `: ${st.error}` : ''}`;
+  return st.status;
+};
+
+/* One browser story at a time, polled for as long as the dashboard is
+ * open. `player` is the latest usePlayback() value the Sleep page saw;
+ * `listener` is the mounted card's state setter (null while the page is
+ * away). */
+const storyPoller = {
+  story: null, queued: new Set(), bedQueued: false, timer: null,
+  player: null, listener: null, sounds: [], timerMin: 45,
+
+  start(story) {
+    this.stop();
+    this.story = story;
+    this.queued = new Set();
+    this.bedQueued = false;
+    this.poll();
+    this.timer = setInterval(() => this.poll(), STORY_POLL_MS);
+  },
+  stop() {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  },
+  forget() {
+    this.stop();
+    this.story = null;
+    if (this.listener) this.listener(null);
+  },
+  async poll() {
+    const story = this.story;
+    const player = this.player;
+    if (!story || !player) return;
+    let data;
+    try {
+      data = await apiGet(`${SLEEP_API}/stories/${story.id}`, { quiet: true });
+    } catch (e) {
+      return;                       /* retried on the next poll */
+    }
+    if (!this.story || this.story.id !== story.id) return;
+    const fresh = data.segments.filter(g => !this.queued.has(g.n));
+    if (fresh.length) {
+      const items = fresh.map(g => storyQueueItem(data.story, g));
+      const first = this.queued.size === 0;
+      fresh.forEach(g => this.queued.add(g.n));
+      if (first) {
+        player.playItems(items);
+      } else {
+        const wasIdle = player.status !== 'playing';
+        player.enqueue(items);
+        if (wasIdle) player.next();  /* it ran dry waiting for this one */
+      }
+    }
+    const st = data.story;
+    // The sleep sound carries on after the ending, until the sleep timer.
+    if (st.writing_done && st.bed_sound && !this.bedQueued
+        && this.queued.size === data.segments.length) {
+      const bed = this.sounds.find(x => x.key === st.bed_sound);
+      if (bed) {
+        this.bedQueued = true;
+        player.enqueue([sleepQueueItem(bed, null)]);
+        const left = data.segments.reduce((a, g) => a + (g.duration_sec || 0), 0)
+          - Math.max(0, (Date.now() - new Date(st.created_at).getTime()) / 1000);
+        player.setSleep(Math.max(1, Math.round(Math.max(0, left) / 60) + this.timerMin));
+      }
+    }
+    this.story = st;
+    if (this.listener) this.listener(st);
+    if (!['writing', 'playing'].includes(st.status)) this.stop();
+  },
+};
+
+const inputStyle = {
+  width: '100%', boxSizing: 'border-box', fontSize: 13, padding: '8px 10px',
+  borderRadius: 8, border: '1px solid var(--line, var(--border, rgba(127,127,127,.35)))',
+  background: 'transparent', color: 'inherit', fontFamily: 'inherit',
+};
+
+const ChipRow = ({ label, children }) => (
+  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+    <span style={{ fontSize: 11, color: 'var(--fg-muted)', minWidth: 64 }}>{label}</span>
+    {children}
+  </div>
+);
+
+const StoryCard = ({ rooms, sounds, sizes, roomStories, defaults, busy, fire, refresh }) => {
+  const player = usePlayback();
+  const [target, setTarget] = React.useState(null);
+  const [sizeKey, setSizeKey] = React.useState('m');
+  const [customMin, setCustomMin] = React.useState('');
+  const [premise, setPremise] = React.useState('');
+  const [tone, setTone] = React.useState('cozy');
+  const [audience, setAudience] = React.useState('kids');
+  const [bed, setBed] = React.useState('');
+  const [ideas, setIdeas] = React.useState([]);
+  const [thinking, setThinking] = React.useState(false);
+  const [starting, setStarting] = React.useState(false);
+  const [browserStory, setBrowserStory] = React.useState(storyPoller.story);
+
+  const chosenTarget = target || rooms[0] || BROWSER_TARGET;
+  const custom = parseInt(customMin, 10);
+  const minutes = custom > 0
+    ? Math.min(custom, 180)
+    : (sizes.find(s => s.key === sizeKey) || { minutes: 10 }).minutes;
+
+  // The poller outlives this card: hand it the latest player and sounds,
+  // and listen to it while the card is on screen.
+  storyPoller.player = player;
+  storyPoller.sounds = sounds;
+  storyPoller.timerMin = (defaults && defaults.default_timer_min) || 45;
+  React.useEffect(() => {
+    storyPoller.listener = setBrowserStory;
+    return () => { storyPoller.listener = null; };
+  }, []);
+
+  const surprise = async () => {
+    setThinking(true);
+    try {
+      const r = await apiPost(`${SLEEP_API}/stories/ideas`, { tone, audience, hint: premise });
+      setIdeas(r.ideas || []);
+      if (!(r.ideas || []).length) fire('no ideas came back — try again');
+    } catch (e) {
+      fire(`couldn't get ideas: ${e.message}`);
+    } finally {
+      setThinking(false);
+    }
+  };
+
+  const start = async () => {
+    if (chosenTarget === BROWSER_TARGET && !player.available) {
+      fire('browser player not available'); return;
+    }
+    setStarting(true);
+    try {
+      const r = await apiPost(`${SLEEP_API}/stories`, {
+        room_id: chosenTarget === BROWSER_TARGET ? null : chosenTarget,
+        minutes, premise, tone, audience, bed_sound: bed || null,
+      });
+      if (chosenTarget === BROWSER_TARGET) {
+        setBrowserStory(r.story);
+        storyPoller.start(r.story);
+        fire(`writing a ${minutes}-minute story — it starts here in a moment`);
+      } else {
+        fire(`writing a ${minutes}-minute story for ${chosenTarget}`);
+      }
+      setIdeas([]);
+      refresh();
+    } catch (e) {
+      fire(`couldn't start the story: ${e.message}`);
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const stopStory = async (id, isBrowser) => {
+    try {
+      await apiPost(`${SLEEP_API}/stories/${id}/stop`, {});
+      if (isBrowser) {
+        player.stop();
+        storyPoller.forget();
+      }
+      fire('story stopped');
+      refresh();
+    } catch (e) {
+      fire(`stop failed: ${e.message}`);
+    }
+  };
+
+  const liveBrowser = browserStory && ['writing', 'playing'].includes(browserStory.status)
+    ? browserStory : null;
+
+  return (
+    <Card title="storytime">
+      <div style={{ padding: '4px 14px 14px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {(roomStories.length > 0 || browserStory) && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {roomStories.map(st => (
+              <div key={st.id} style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <RoomChip name={st.room_id} online={st.status === 'playing'}/>
+                <Pill tone={st.status === 'failed' ? 'warn' : 'brand'} live={st.status !== 'failed'}>
+                  {storyStatusWords(st)}
+                </Pill>
+                <span style={{ fontSize: 13, fontWeight: 500 }}>{st.title || st.premise || 'a bedtime story'}</span>
+                <span className="mono" style={{ fontSize: 11, color: 'var(--fg-muted)' }}>{st.minutes}m</span>
+                {st.status !== 'failed' && (
+                  <Button icon="square" disabled={busy} style={{ marginLeft: 'auto' }}
+                          onClick={() => stopStory(st.id, false)}>stop</Button>
+                )}
+              </div>
+            ))}
+            {browserStory && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <Pill tone={browserStory.status === 'failed' ? 'warn' : 'brand'} live={!!liveBrowser}>
+                  this browser · {storyStatusWords(browserStory)}
+                </Pill>
+                <span style={{ fontSize: 13, fontWeight: 500 }}>
+                  {browserStory.title || browserStory.premise || 'a bedtime story'}
+                </span>
+                {liveBrowser ? (
+                  <Button icon="square" style={{ marginLeft: 'auto' }}
+                          onClick={() => stopStory(browserStory.id, true)}>stop</Button>
+                ) : (
+                  <button className="btn btn-ghost" style={{ marginLeft: 'auto', fontSize: 11 }}
+                          onClick={() => storyPoller.forget()}>clear</button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        <textarea
+          rows={2}
+          style={{ ...inputStyle, resize: 'vertical' }}
+          placeholder="what's it about? e.g. a sleepy dragon who can't find his blanket (leave empty and I'll pick)"
+          value={premise}
+          maxLength={500}
+          onChange={(e) => setPremise(e.target.value)}
+        />
+
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          <button className="btn btn-secondary" disabled={thinking} onClick={surprise}>
+            {thinking ? 'thinking…' : 'surprise me'}
+          </button>
+          {ideas.map((idea, i) => (
+            <button key={i} className={`btn ${premise === idea ? 'btn-primary' : 'btn-ghost'}`}
+                    style={{ fontSize: 12, textAlign: 'left', whiteSpace: 'normal' }}
+                    onClick={() => setPremise(idea)}>
+              {idea}
+            </button>
+          ))}
+        </div>
+
+        <ChipRow label="length">
+          {sizes.map(s => (
+            <button key={s.key}
+                    className={`btn ${!(custom > 0) && sizeKey === s.key ? 'btn-primary' : 'btn-ghost'}`}
+                    style={{ fontSize: 11 }}
+                    title={`${s.minutes} minutes`}
+                    onClick={() => { setSizeKey(s.key); setCustomMin(''); }}>
+              {s.label} · {s.minutes}m
+            </button>
+          ))}
+          <input type="number" min="1" max="180" placeholder="min"
+                 value={customMin} onChange={(e) => setCustomMin(e.target.value)}
+                 style={{ ...inputStyle, width: 72, padding: '4px 8px', fontSize: 12 }}
+                 aria-label="custom length in minutes"/>
+        </ChipRow>
+
+        <ChipRow label="tone">
+          {STORY_TONES.map(t => (
+            <button key={t} className={`btn ${tone === t ? 'btn-primary' : 'btn-ghost'}`}
+                    style={{ fontSize: 11 }} onClick={() => setTone(t)}>{t}</button>
+          ))}
+        </ChipRow>
+
+        <ChipRow label="for">
+          {STORY_AUDIENCES.map(([k, label]) => (
+            <button key={k} className={`btn ${audience === k ? 'btn-primary' : 'btn-ghost'}`}
+                    style={{ fontSize: 11 }} onClick={() => setAudience(k)}>{label}</button>
+          ))}
+        </ChipRow>
+
+        <ChipRow label="underneath">
+          <select value={bed} onChange={(e) => setBed(e.target.value)}
+                  style={{ ...inputStyle, width: 'auto', padding: '4px 8px', fontSize: 12 }}>
+            <option value="">no sound</option>
+            {sounds.map(s => <option key={s.key} value={s.key}>{s.title.toLowerCase()}</option>)}
+          </select>
+          {bed && (
+            <span style={{ fontSize: 11, color: 'var(--fg-faint)' }}>
+              keeps playing after the story, until the sleep timer
+            </span>
+          )}
+        </ChipRow>
+
+        <ChipRow label="play in">
+          <select value={chosenTarget} onChange={(e) => setTarget(e.target.value)}
+                  style={{ ...inputStyle, width: 'auto', padding: '4px 8px', fontSize: 12 }}>
+            {rooms.map(r => <option key={r} value={r}>{r}</option>)}
+            <option value={BROWSER_TARGET}>this browser</option>
+          </select>
+          <Button icon="play" disabled={busy || starting} style={{ marginLeft: 'auto' }}
+                  onClick={start}>
+            {starting ? 'starting…' : `tell a ${minutes}-minute story`}
+          </Button>
+        </ChipRow>
+
+        <div style={{ fontSize: 11, color: 'var(--fg-faint)' }}>
+          written as it plays by the house's AI model, in the room's own voice
+          (this browser: the server's voice) · or just say "tell me a huge
+          bedtime story about otters"
         </div>
       </div>
     </Card>
@@ -312,6 +645,12 @@ const SleepPage = () => {
 
       {sounds.length > 0 && (
         <BrowserPlayCard sounds={sounds} defaults={defaults} fire={fire}/>
+      )}
+
+      {overview && overview.core_online !== false && (overview.story_sizes || []).length > 0 && (
+        <StoryCard rooms={rooms} sounds={sounds} sizes={overview.story_sizes}
+                   roomStories={overview.stories || []} defaults={defaults} busy={busy}
+                   fire={fire} refresh={refresh}/>
       )}
 
       {loading && !overview ? (

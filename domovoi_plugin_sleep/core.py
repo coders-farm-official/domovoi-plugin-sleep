@@ -7,6 +7,7 @@ Wires, in order:
   manifest's declared capabilities are contract-checked against);
 * the SleepHandler at band 275 (play / stop / list by voice);
 * the timer poll worker (timer enforcement + session reconciliation);
+* the story writer poll worker (Storytime: stories.py);
 * the ``sleep_generator`` startup hook — renders any missing/drifted
   sound files with ffmpeg and tells every room player to rescan. First
   run takes a few minutes (5 sounds x file_length); the handler answers
@@ -35,9 +36,10 @@ from sqlalchemy import text
 
 from domovoi.sdk import PluginSDK, device_endpoint
 
-from domovoi_plugin_sleep import SCHEMA, sessions, sounds
+from domovoi_plugin_sleep import SCHEMA, sessions, sounds, stories
 from domovoi_plugin_sleep.handlers.sleep import SleepHandler
 from domovoi_plugin_sleep.settings import SLEEP_FIELDSPECS, SleepSettings
+from domovoi_plugin_sleep.workers.story_writer import StoryWriter
 from domovoi_plugin_sleep.workers.timer import SleepTimer
 
 log = logging.getLogger(__name__)
@@ -60,6 +62,7 @@ def register(ctx: Any) -> None:
 
     # ── Background work. ────────────────────────────────────────────────
     ctx.add_worker(SleepTimer(sdk))
+    ctx.add_worker(StoryWriter(sdk))
 
     async def _generate() -> None:
         """Render missing/drifted sounds, then the MPD rescan fan-out.
@@ -148,6 +151,23 @@ class StopBody(BaseModel):
     fade: bool = False
 
 
+class StoryBody(BaseModel):
+    # None: a story the browser plays itself (the server's voice).
+    room_id: str | None = Field(default=None, min_length=1)
+    size: str | None = None
+    minutes: int | None = Field(default=None, ge=1, le=180)
+    premise: str = Field(default="", max_length=500)
+    tone: str = "cozy"
+    audience: str = "kids"
+    bed_sound: str | None = None
+
+
+class IdeasBody(BaseModel):
+    tone: str = "cozy"
+    audience: str = "kids"
+    hint: str = Field(default="", max_length=200)
+
+
 def _build_core_router(sdk: PluginSDK) -> APIRouter:
     router = APIRouter()
 
@@ -222,6 +242,46 @@ def _build_core_router(sdk: PluginSDK) -> APIRouter:
         resp = await sessions.stop(sdk, body.room_id, fade=body.fade)
         await sessions.deliver(sdk, resp, body.room_id)
         return {"ok": True, "room_id": body.room_id}
+
+    # ── Storytime ──────────────────────────────────────────────────────
+    # Starting and stopping a story are household actions like play and
+    # stop (device tier). The writer worker does the slow part.
+
+    @router.post("/stories")
+    @device_endpoint
+    async def story_start(body: StoryBody):
+        minutes = body.minutes or stories.size_minutes(body.size)
+        try:
+            story = await stories.start(
+                sdk, room_id=body.room_id, minutes=minutes,
+                premise=body.premise, tone=body.tone, audience=body.audience,
+                bed_sound=body.bed_sound,
+            )
+        except stories.StoryError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        return {"ok": True, "story": _session_payload(story)}
+
+    @router.post("/stories/ideas")
+    @device_endpoint
+    async def story_ideas(body: IdeasBody):
+        try:
+            found = await stories.ideas(
+                sdk, tone=body.tone, audience=body.audience, hint=body.hint,
+            )
+        except stories.StoryError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except Exception as e:  # noqa: BLE001 - the model is down or slow
+            log.warning("sleep: story ideas failed: %s", e)
+            raise HTTPException(status_code=502, detail="the story model didn't answer")
+        return {"ideas": found}
+
+    @router.post("/stories/{story_id}/stop")
+    @device_endpoint
+    async def story_stop(story_id: int):
+        story = await stories.stop(sdk, story_id)
+        if story is None:
+            raise HTTPException(status_code=404, detail="no such story")
+        return {"ok": True, "story": _session_payload(story)}
 
     @router.post("/regenerate")
     async def regenerate():
