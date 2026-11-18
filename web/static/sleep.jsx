@@ -13,6 +13,8 @@
  *   * POST /api/plugins/sleep/stories[/ideas|/{id}/stop] — Storytime
  *   * GET  /api/plugins/sleep/stories/{id}  — a browser story's passages
  *     (and its heartbeat)
+ *   * GET  /api/plugins/sleep/stories/history[/export] — Story history,
+ *     paged by cursor; /stories/{id}/text|export — one story's words / .md
  *   * GET  /api/plugins/sleep/sounds/{key}/stream — browser playback
  *     (the manifest's [[web.player_sources]] route, via usePlayback)
  *   * /ws/state · `sleep.sessions.changed`  — live refetch nudge
@@ -23,7 +25,8 @@
  *
  * Core-bundle globals used (loaded before any plugin script): React,
  * Card, Button, Icon, Pill, Empty, PageHeader, RoomChip, useToast,
- * apiGet, apiPost, useApiObject, usePlayback.
+ * apiGet, apiPost, apiFetchRaw, apiErrorText, isAuthFailure, useApiObject,
+ * usePagedList, PagedListFooter, usePlayback.
  */
 
 const SLEEP_API = '/api/plugins/sleep';
@@ -529,6 +532,210 @@ const StoryCard = ({ rooms, sounds, sizes, roomStories, defaults, busy, fire, re
   );
 };
 
+/* ---- Story history -------------------------------------------------- */
+/* The stories told in the last 30 days, newest first, a page at a time
+ * as you scroll (data.js usePagedList + PagedListFooter, the same paging
+ * the Music and Files pages use). Opening an entry reads its words; each
+ * story, or the whole list, downloads as a Markdown (.md) file. Rooms are
+ * named the way the rest of this page names them. */
+const HISTORY_PAGE = 20;
+const HISTORY_BROWSER = '__browser__';
+
+const historyWhen = (iso) => {
+  try {
+    return new Date(iso).toLocaleString(undefined, {
+      weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+    });
+  } catch { return iso; }
+};
+
+/* "ran 12 min", "ran 1 h 5 min", "ran under a minute"; null when it never played. */
+const historyRan = (sec) => {
+  if (!(sec > 0)) return null;
+  const min = Math.round(sec / 60);
+  if (min < 1) return 'ran under a minute';
+  if (min < 60) return `ran ${min} min`;
+  return `ran ${Math.floor(min / 60)} h${min % 60 ? ` ${min % 60} min` : ''}`;
+};
+
+const historyEnding = (st) => {
+  if (st.status === 'done') return { tone: 'ok', words: 'finished' };
+  if (st.status === 'stopped') return { tone: 'idle', words: 'stopped early' };
+  if (st.status === 'failed') return { tone: 'err', words: 'failed' };
+  return { tone: 'idle', words: st.status };
+};
+
+/* Fetch a Markdown download with this browser's credentials (a plain link
+ * can't carry the household token) and save it under the server's .md
+ * name. Anything that isn't the Markdown file (a refusal, a sign-in page)
+ * is said in a toast, never saved. */
+const sleepSaveMarkdown = async (path, fallbackName, fire) => {
+  let r;
+  try {
+    r = await apiFetchRaw(path);
+  } catch (e) {
+    if (!isAuthFailure(e)) fire(`couldn't download: ${apiErrorText(e)}`);
+    return;
+  }
+  if (!r.ok) {
+    let msg = `couldn't download: the server said ${r.status}`;
+    try {
+      const body = await r.json();
+      if (body && typeof body.detail === 'string') msg = body.detail;
+    } catch { /* not JSON: keep the status */ }
+    fire(msg);
+    return;
+  }
+  if (!/markdown/i.test(r.headers.get('content-type') || '')) {
+    fire("couldn't download: the server didn't send a story file");
+    return;
+  }
+  const m = /filename="([^"]+)"/.exec(r.headers.get('content-disposition') || '');
+  let name = m ? m[1] : fallbackName;
+  if (!/\.md$/i.test(name)) name = `${name}.md`;
+  const blob = new Blob([await r.arrayBuffer()], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+const HistoryEntry = ({ st, fire }) => {
+  const [open, setOpen] = React.useState(false);
+  const [words, setWords] = React.useState(null);   // null = not read yet
+  const [error, setError] = React.useState(null);
+  const ending = historyEnding(st);
+  const ran = historyRan(st.ran_sec);
+
+  const toggle = async () => {
+    const next = !open;
+    setOpen(next);
+    if (!next || words !== null || !st.has_text) return;
+    try {
+      const r = await apiGet(`${SLEEP_API}/stories/${st.id}/text`);
+      setWords(r.passages || []);
+      setError(null);
+    } catch (e) {
+      setError(apiErrorText(e));
+    }
+  };
+
+  return (
+    <div style={{ borderTop: '1px solid var(--line, var(--border, rgba(127,127,127,.25)))' }}>
+      <button type="button" onClick={toggle} aria-expanded={open}
+              style={{ all: 'unset', boxSizing: 'border-box', width: '100%', cursor: 'pointer',
+                       padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <Icon name={open ? 'chevron-down' : 'chevron-right'} size={14}/>
+          <span style={{ fontSize: 13, fontWeight: 500 }}>{st.title || 'Bedtime story'}</span>
+          {st.room_id
+            ? <RoomChip name={st.room_id} online={false}/>
+            : <span style={{ fontSize: 12, color: 'var(--fg-muted)' }}>in a browser</span>}
+          <span style={{ marginLeft: 'auto' }}>
+            <Pill tone={ending.tone}>{ending.words}</Pill>
+          </span>
+        </div>
+        <div style={{ fontSize: 12, color: 'var(--fg-muted)', paddingLeft: 22 }}>
+          <span title={new Date(st.created_at).toLocaleString()}>{historyWhen(st.created_at)}</span>
+          {ran ? ` · ${ran}` : ' · didn’t play'}
+          {` · asked for ${st.minutes} min`}
+        </div>
+        {st.premise && (
+          <div style={{ fontSize: 12, color: 'var(--fg-muted)', paddingLeft: 22 }}>
+            about {st.premise}
+          </div>
+        )}
+        {st.status === 'failed' && st.error && (
+          <div style={{ fontSize: 12, color: 'var(--err-ink, var(--warn-ink))', paddingLeft: 22 }}>
+            {st.error}
+          </div>
+        )}
+      </button>
+
+      {open && (
+        <div style={{ padding: '0 14px 14px 36px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {!st.has_text ? (
+            <div style={{ fontSize: 12, color: 'var(--fg-faint)' }}>
+              {st.passages > 0 ? 'the words of this story are no longer kept' : 'nothing was written for this story'}
+            </div>
+          ) : error ? (
+            <div style={{ fontSize: 12, color: 'var(--fg-muted)' }}>couldn’t read the story: {error}</div>
+          ) : words === null ? (
+            <div style={{ fontSize: 12, color: 'var(--fg-muted)' }}>loading…</div>
+          ) : (
+            <>
+              <div style={{ fontSize: 14, lineHeight: 1.6, display: 'flex', flexDirection: 'column', gap: 10,
+                            maxHeight: 420, overflowY: 'auto', paddingRight: 6 }}>
+                {words.map((p, i) => <p key={i} style={{ margin: 0 }}>{p}</p>)}
+              </div>
+              <div>
+                <Button icon="download" title="save this story as a Markdown (.md) file"
+                        onClick={() => sleepSaveMarkdown(`${SLEEP_API}/stories/${st.id}/export`,
+                                                         `bedtime-story-${st.id}.md`, fire)}>
+                  download
+                </Button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const StoryHistoryCard = ({ fire }) => {
+  const [room, setRoom] = React.useState('');
+  const path = `${SLEEP_API}/stories/history${room ? `?room=${encodeURIComponent(room)}` : ''}`;
+  const list = usePagedList(path, { pageSize: HISTORY_PAGE, eventTypes: ['sleep.sessions.changed'] });
+  const extra = list.extra || {};
+  const keepDays = extra.keep_days || 30;
+  const choices = [...(extra.rooms || []).map(r => [r, r]),
+                   ...(extra.browser ? [[HISTORY_BROWSER, 'a browser']] : [])];
+  const anyText = typeof extra.with_text === 'number' ? extra.with_text > 0
+    : list.items.some(st => st.has_text);
+
+  const saveAll = () => sleepSaveMarkdown(
+    `${SLEEP_API}/stories/history/export${room ? `?room=${encodeURIComponent(room)}` : ''}`,
+    'bedtime-stories.md', fire);
+
+  return (
+    <Card title="story history"
+          sub={`the stories told here in the last ${keepDays} days`}
+          action={anyText ? (
+            <Button icon="download" onClick={saveAll}
+                    title={room ? 'save these stories as one Markdown (.md) file'
+                                : 'save every story here as one Markdown (.md) file'}>
+              {room ? 'download these' : 'download all'}
+            </Button>
+          ) : null}>
+      {(choices.length > 1 || room) && (
+        <div style={{ padding: '4px 14px 10px', display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 11, color: 'var(--fg-muted)' }}>played in</span>
+          <select value={room} onChange={(e) => setRoom(e.target.value)}
+                  style={{ ...inputStyle, width: 'auto', padding: '4px 8px', fontSize: 12 }}>
+            <option value="">every room</option>
+            {choices.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
+          </select>
+        </div>
+      )}
+      {list.items.length === 0 && !list.loading && !list.error ? (
+        <div style={{ padding: '6px 14px 14px', fontSize: 12, color: 'var(--fg-muted)' }}>
+          {room ? 'no stories played here in this time' : `no stories in the last ${keepDays} days`}
+        </div>
+      ) : (
+        <div>
+          {list.items.map(st => <HistoryEntry key={st.id} st={st} fire={fire}/>)}
+        </div>
+      )}
+      <PagedListFooter list={list} noun="stories" compact/>
+    </Card>
+  );
+};
+
 /* ---- Page ---------------------------------------------------------- */
 const SleepPage = () => {
   const [fire, toastNode] = useToast();
@@ -555,6 +762,29 @@ const SleepPage = () => {
     const t = setInterval(refresh, 10000);
     return () => clearInterval(t);
   }, [generating, refresh]);
+
+  // A safety net under the live pushes while something plays: a push can
+  // be missed (a dropped socket, two reads crossing so the older answer
+  // lands last), and then a story or sound that ended stayed on screen
+  // until a reload. Re-read every 20 s while anything is live, and just
+  // after the nearest sleep timer runs out.
+  const roomStories = overview?.stories || [];
+  const anyLive = sessions.length > 0
+    || roomStories.some(st => ['writing', 'playing'].includes(st.status));
+  React.useEffect(() => {
+    if (!anyLive) return undefined;
+    const t = setInterval(() => { if (!document.hidden) refresh(); }, 20000);
+    return () => clearInterval(t);
+  }, [anyLive, refresh]);
+  const nextStop = sessions
+    .map(s => (s.stop_at ? new Date(s.stop_at).getTime() : NaN))
+    .filter(ms => ms > Date.now())
+    .sort((a, b) => a - b)[0];
+  React.useEffect(() => {
+    if (!nextStop) return undefined;
+    const t = setTimeout(refresh, Math.min(nextStop - Date.now() + 8000, 2 ** 31 - 1));
+    return () => clearTimeout(t);
+  }, [nextStop, refresh]);
 
   const onPlay = async (room, sound, minutes) => {
     setBusy(true);
@@ -652,6 +882,8 @@ const SleepPage = () => {
                    roomStories={overview.stories || []} defaults={defaults} busy={busy}
                    fire={fire} refresh={refresh}/>
       )}
+
+      {overview && <StoryHistoryCard fire={fire}/>}
 
       {loading && !overview ? (
         <div style={{ padding: 28, textAlign: 'center', fontSize: 12, color: 'var(--fg-muted)' }}>

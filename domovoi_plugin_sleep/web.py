@@ -24,11 +24,14 @@ the snapshot stays diff-stable).
 from __future__ import annotations
 
 import logging
+import re
+import unicodedata
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -84,6 +87,16 @@ STORY_SIZES = [
     {"key": "xl", "label": "XL", "minutes": 40},
     {"key": "huge", "label": "Huge", "minutes": 90},
 ]
+
+
+# Storytime history (1.4.0): what was told, where, kept for
+# stories.HISTORY_DAYS after it ended (the core side's tidy pass deletes
+# older rows; this process only reads). Mirrored, like STORY_SIZES.
+HISTORY_DAYS = 30
+HISTORY_PAGE = 20
+HISTORY_PAGE_MAX = 200
+#: The room filter's value for "played in a browser" (a story with no room).
+BROWSER_ROOM = "__browser__"
 
 
 def register_web(ctx: Any) -> None:
@@ -236,6 +249,150 @@ def build_router(ctx: Any) -> APIRouter:
     async def story_stop(story_id: int, request: Request) -> dict[str, Any]:
         return await ctx.core.post_admin(f"stories/{story_id}/stop", request=request)
 
+    # ── Storytime history ─────────────────────────────────────────────
+    #
+    # Declared before /stories/{story_id}: "history" would otherwise be
+    # read as a story id. Device tier, like the other reads (a history
+    # says what was told in which room, and when).
+
+    @router.get("/stories/history")
+    @device_endpoint
+    async def story_history(
+        limit: int = Query(HISTORY_PAGE, ge=1, le=HISTORY_PAGE_MAX),
+        cursor: str | None = Query(None, max_length=20),
+        room: str | None = Query(None, max_length=200),
+    ) -> dict[str, Any]:
+        """Finished stories, newest first, a page at a time. ``cursor`` is
+        the id the previous page ended on (keyset: a story that ends while
+        you scroll never shifts a page). ``room`` narrows it to one room,
+        or to ``__browser__`` for the stories played in a browser."""
+        before = _cursor_id(cursor)
+        where, params = _history_where(room)
+        async with session_scope() as s:
+            rows = (
+                await s.execute(
+                    text(
+                        f"SELECT {_HISTORY_COLS} FROM stories t WHERE {where} "
+                        "AND (CAST(:before AS BIGINT) IS NULL OR t.id < :before) "
+                        "ORDER BY t.id DESC LIMIT :lim"
+                    ),
+                    {**params, "before": before, "lim": limit + 1},
+                )
+            ).mappings().all()
+            counts = (
+                await s.execute(
+                    text(
+                        "SELECT COUNT(*), COUNT(*) FILTER (WHERE EXISTS ("
+                        "SELECT 1 FROM story_segments g WHERE g.story_id = t.id)) "
+                        f"FROM stories t WHERE {where}"
+                    ),
+                    params,
+                )
+            ).one()
+            total, with_text = counts[0], counts[1]
+            rooms = (
+                await s.execute(
+                    text(
+                        "SELECT DISTINCT room_id FROM stories "
+                        "WHERE status NOT IN ('writing', 'playing')"
+                    )
+                )
+            ).scalars().all()
+        has_more = len(rows) > limit
+        items = [_history_item(r) for r in rows[:limit]]
+        return {
+            "items": items,
+            "total": total,
+            "has_more": has_more,
+            "next_cursor": str(items[-1]["id"]) if has_more else None,
+            "keep_days": HISTORY_DAYS,
+            # How many of them still have their words (the download-all
+            # button shows only when there is something to save).
+            "with_text": with_text,
+            # The filter's choices: the rooms with history, and whether
+            # any story played in a browser.
+            "rooms": sorted(r for r in rooms if r is not None),
+            "browser": any(r is None for r in rooms),
+        }
+
+    @router.get("/stories/history/export")
+    @device_endpoint
+    async def story_history_export(
+        room: str | None = Query(None, max_length=200),
+    ) -> Response:
+        """Every kept story (or one room's) with its text, as one Markdown
+        file. Stories whose text is gone are left out; none at all is a
+        409, never an empty file."""
+        where, params = _history_where(room)
+        async with session_scope() as s:
+            rows = (
+                await s.execute(
+                    text(
+                        f"SELECT {_HISTORY_COLS} FROM stories t WHERE {where} "
+                        "ORDER BY t.id DESC"
+                    ),
+                    params,
+                )
+            ).mappings().all()
+            texts = await _passages(s, [r["id"] for r in rows])
+        told = [(r, texts[r["id"]]) for r in rows if texts.get(r["id"])]
+        if not told:
+            raise HTTPException(
+                status_code=409,
+                detail="There's no story text to save: no story in this list "
+                "has its words left.",
+            )
+        if not room:
+            part = ""
+        elif room == BROWSER_ROOM:
+            part = "-browser"
+        else:
+            part = f"-{_slug(room) or 'room'}"
+        today = datetime.now().astimezone()
+        return _markdown_response(
+            _history_markdown(told, room),
+            f"bedtime-stories{part}-{today:%Y-%m-%d}.md",
+        )
+
+    @router.get("/stories/{story_id}/text")
+    @device_endpoint
+    async def story_text(story_id: int) -> dict[str, Any]:
+        """One story's history entry and its passages' text, in order
+        (empty once its words are gone)."""
+        row, passages = await _story_with_text(story_id)
+        return {"story": _history_item(row), "passages": passages}
+
+    @router.get("/stories/{story_id}/export")
+    @device_endpoint
+    async def story_export(story_id: int) -> Response:
+        """One story as a Markdown file. A story with no text left is a
+        409 saying so, never an empty file."""
+        row, passages = await _story_with_text(story_id)
+        if not passages:
+            raise HTTPException(
+                status_code=409,
+                detail="This story's words are gone, so there's nothing to save.",
+            )
+        item = _history_item(row)
+        slug = _slug(item["title"]) or "bedtime-story"
+        when = _local(row["created_at"])
+        return _markdown_response(
+            _story_markdown(item, passages, level=1), f"{slug}-{when:%Y-%m-%d}.md"
+        )
+
+    async def _story_with_text(story_id: int) -> tuple[Any, list[str]]:
+        async with session_scope() as s:
+            row = (
+                await s.execute(
+                    text(f"SELECT {_HISTORY_COLS} FROM stories t WHERE t.id = :id"),
+                    {"id": story_id},
+                )
+            ).mappings().first()
+            if row is None:
+                raise HTTPException(status_code=404, detail="no such story")
+            texts = await _passages(s, [story_id])
+        return row, texts.get(story_id, [])
+
     @router.get("/stories/{story_id}")
     @device_endpoint
     async def story_read(story_id: int) -> dict[str, Any]:
@@ -367,6 +524,204 @@ def build_router(ctx: Any) -> APIRouter:
         return FileResponse(str(target), media_type=media_type)
 
     return router
+
+
+# ─── Storytime history ───────────────────────────────────────────────────
+
+# ``has_text``: whether any passage's words are still kept (the text goes
+# with the row after HISTORY_DAYS; stories tidied by 1.3.x lost theirs at
+# 12 hours, and a story that failed before its first passage has none).
+_HISTORY_COLS = (
+    "t.id, t.room_id, t.title, t.premise, t.minutes, t.status, t.error, "
+    "t.segments, t.audio_sec, t.words, t.playback_started_at, t.created_at, "
+    "COALESCE(t.ended_at, t.updated_at) AS ended_at, "
+    "EXISTS (SELECT 1 FROM story_segments g WHERE g.story_id = t.id) AS has_text"
+)
+
+
+def _cursor_id(cursor: str | None) -> int | None:
+    if cursor in (None, ""):
+        return None
+    try:
+        value = int(cursor)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise HTTPException(status_code=400, detail="that page cursor isn't one of ours")
+    return value
+
+
+def _history_where(room: str | None) -> tuple[str, dict[str, Any]]:
+    """Finished stories only (a live one is on the Storytime card), and
+    one room's, or the browser's, when the filter asks."""
+    where = "t.status NOT IN ('writing', 'playing')"
+    if not room:
+        return where, {}
+    if room == BROWSER_ROOM:
+        return where + " AND t.room_id IS NULL", {}
+    return where + " AND t.room_id = :room", {"room": room}
+
+
+def _ran_sec(row: Any) -> float:
+    """How long the story played: all of it when it finished; up to the
+    moment it was stopped otherwise (never more than was written)."""
+    audio = float(row["audio_sec"] or 0)
+    started = row["playback_started_at"]
+    if started is None or audio <= 0:
+        return 0.0
+    if row["status"] == "done":
+        return audio
+    ended = row["ended_at"]
+    if ended is None:
+        return audio
+    return max(0.0, min(audio, (ended - started).total_seconds()))
+
+
+def _history_item(row: Any) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "room_id": row["room_id"],
+        "title": row["title"] or "",
+        "premise": row["premise"] or "",
+        "minutes": row["minutes"],
+        "status": row["status"],
+        "error": row["error"] if row["status"] == "failed" else None,
+        "passages": row["segments"],
+        "words": row["words"],
+        "ran_sec": round(_ran_sec(row)),
+        "has_text": bool(row["has_text"]),
+        "created_at": row["created_at"].isoformat(),
+        "ended_at": row["ended_at"].isoformat() if row["ended_at"] else None,
+    }
+
+
+async def _passages(session: AsyncSession, ids: list[int]) -> dict[int, list[str]]:
+    if not ids:
+        return {}
+    rows = (
+        await session.execute(
+            text(
+                "SELECT story_id, text FROM story_segments "
+                "WHERE story_id = ANY(:ids) ORDER BY story_id, n"
+            ),
+            {"ids": ids},
+        )
+    ).all()
+    out: dict[int, list[str]] = {}
+    for story_id, passage in rows:
+        if passage and passage.strip():
+            out.setdefault(story_id, []).append(passage.strip())
+    return out
+
+
+def _local(dt: datetime) -> datetime:
+    """An instant on the house's wall clock: the server's own zone, the
+    one "what time is it" answers in."""
+    return dt.astimezone()
+
+
+def _when_words(dt: datetime) -> str:
+    local = _local(dt)
+    hour = local.hour % 12 or 12
+    ampm = "am" if local.hour < 12 else "pm"
+    return f"{local:%A} {local.day} {local:%B %Y}, {hour}:{local:%M} {ampm}"
+
+
+def _length_words(sec: float) -> str:
+    minutes = int(round(sec / 60))
+    if minutes < 1:
+        return "under a minute"
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    h, m = divmod(minutes, 60)
+    return f"{h} hour{'s' if h != 1 else ''}" + (f" {m} min" if m else "")
+
+
+def _ending_words(item: dict[str, Any]) -> str:
+    if item["status"] == "done":
+        return "finished"
+    if item["status"] == "stopped":
+        return "stopped early"
+    if item["status"] == "failed":
+        return "couldn't be told" + (f": {item['error']}" if item.get("error") else "")
+    return item["status"]
+
+
+def _where_words(room_id: str | None) -> str:
+    return room_id if room_id else "played in a browser"
+
+
+_MD_SPECIAL = re.compile(r"([\\`*_{}\[\]<>#|!~])")
+
+
+def _md_line(value: str) -> str:
+    """One line of plain text that Markdown won't read as markup."""
+    value = re.sub(r"\s+", " ", value or "").strip()
+    return _MD_SPECIAL.sub(r"\\\1", value)
+
+
+def _md_paragraph(value: str) -> str:
+    value = _md_line(value)
+    # A paragraph that starts like a list item stays a paragraph.
+    return re.sub(r"^([-+]|\d+[.)])(\s)", r"\\\1\2", value)
+
+
+def _story_markdown(item: dict[str, Any], passages: list[str], *, level: int) -> str:
+    title = item["title"] or "Bedtime story"
+    meta = [
+        _where_words(item["room_id"]),
+        _when_words(datetime.fromisoformat(item["created_at"])),
+        f"ran {_length_words(item['ran_sec'])}" if item["ran_sec"] > 0 else "didn't play",
+        _ending_words(item),
+    ]
+    lines = [f"{'#' * level} {_md_line(title)}", ""]
+    lines.append("*" + _md_line(" · ".join(meta)) + "*")
+    if item["premise"]:
+        lines += ["", "*About: " + _md_line(item["premise"]) + "*"]
+    for passage in passages:
+        lines += ["", _md_paragraph(passage)]
+    return "\n".join(lines) + "\n"
+
+
+def _history_markdown(told: list[tuple[Any, list[str]]], room: str | None) -> str:
+    if not room:
+        heading = "Bedtime stories"
+    elif room == BROWSER_ROOM:
+        heading = "Bedtime stories played in a browser"
+    else:
+        heading = f"Bedtime stories in {room}"
+    count = len(told)
+    parts = [
+        f"# {_md_line(heading)}",
+        "",
+        f"*{count} {'story' if count == 1 else 'stories'} from the last "
+        f"{HISTORY_DAYS} days, saved {_md_line(_when_words(datetime.now().astimezone()))}*",
+    ]
+    for row, passages in told:
+        parts += ["", "---", "", _story_markdown(_history_item(row), passages, level=2).rstrip("\n")]
+    return "\n".join(parts) + "\n"
+
+
+def _slug(value: str) -> str:
+    """A filename-safe slug: ASCII letters, digits and dashes, at most 60."""
+    ascii_ = unicodedata.normalize("NFKD", value or "").encode("ascii", "ignore").decode()
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_.lower()).strip("-")
+    return slug[:60].rstrip("-")
+
+
+def _markdown_response(md: str, filename: str) -> Response:
+    """A Markdown download: attachment, a .md name (plain ASCII, so the
+    quoted form needs no escaping), UTF-8, and never cached (the history
+    changes)."""
+    return Response(
+        content=md.encode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 # ─── Rows → payload ──────────────────────────────────────────────────────

@@ -56,6 +56,12 @@ WEB_TIERS = {
     ("POST", "/stories/ideas"): "device",
     ("POST", "/stories/{story_id}/stop"): "device",
     ("GET", "/stories/{story_id}"): "device",
+    # Story history (1.4.0): what was told in which room, its words, and
+    # the Markdown downloads, all household reads.
+    ("GET", "/stories/history"): "device",
+    ("GET", "/stories/history/export"): "device",
+    ("GET", "/stories/{story_id}/text"): "device",
+    ("GET", "/stories/{story_id}/export"): "device",
     ("POST", "/regenerate"): "admin",
 }
 

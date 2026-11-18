@@ -327,5 +327,32 @@ async def _story_still_playing(
     if story["bed_sound"]:
         bed = sounds.resolve(sdk.config, sdk.core_config.music_dir, story["bed_sound"])
         if bed is not None and playing == sounds.mpd_uri(sdk.config, bed):
+            if story["writing_done"]:
+                await _story_over_sound_plays_on(sdk, session, story_id, bed)
             return True
     return False
+
+
+async def _story_over_sound_plays_on(
+    sdk: PluginSDK, session: dict[str, Any], story_id: int, bed: sounds.Sound
+) -> None:
+    """The ending has played and the room is on the sleep sound that was
+    under it: the story is over (the page and the history say so now, not
+    when the sleep timer runs out), and the room's session becomes that
+    sound's, timer and all, so stop and the countdown carry on as for any
+    sound. Until 1.4.0 the story stayed "playing" for the whole sleep
+    timer after its ending (reported 2026-11-17: the page kept showing a
+    story as still playing well after it was over)."""
+    from domovoi_plugin_sleep import stories   # stories imports this module
+
+    async with sdk.db.session_scope() as s:
+        await s.execute(
+            text(
+                f"UPDATE {SCHEMA}.sleep_sessions SET sound_key = :key, "
+                "title = :title, mpd_uri = :uri, updated_at = NOW() "
+                "WHERE room_id = :room AND active AND sound_key = :story_key"
+            ),
+            {"key": bed.key, "title": bed.title, "uri": sounds.mpd_uri(sdk.config, bed),
+             "room": session["room_id"], "story_key": session["sound_key"]},
+        )
+    await stories._update(sdk, story_id, status="done", notify="story")

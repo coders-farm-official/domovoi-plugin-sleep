@@ -82,8 +82,12 @@ PASSAGE_WORDS = 260
 PASSAGE_GAP_SEC = 0.8
 #: The sleep sound under the story, as a gain on the narration mix.
 BED_GAIN = 0.22
-#: Finished stories' files are deleted after this long.
+#: Finished stories' audio files are deleted after this long (disk
+#: matters, and nobody replays a story).
 KEEP_HOURS = 12
+#: A finished story's row and passage text (the Sleep page's history)
+#: are deleted after this long (owner's call, 2026-11-17).
+HISTORY_DAYS = 30
 
 STORIES_SUBDIR = "Stories"
 LIVE = ("writing", "playing")
@@ -197,6 +201,9 @@ async def segments(sdk: PluginSDK, story_id: int) -> list[dict[str, Any]]:
 async def _update(sdk: PluginSDK, story_id: int, *, notify: str | None = None,
                   **fields: Any) -> None:
     sets = ", ".join(f"{k} = :{k}" for k in fields)
+    if fields.get("status") not in (None, *LIVE):
+        # The story's end: the history's clock and its "ran for".
+        sets += ", ended_at = COALESCE(ended_at, NOW())"
     async with sdk.db.session_scope() as s:
         await s.execute(
             text(
@@ -214,7 +221,8 @@ async def _end_room_stories(sdk: PluginSDK, room_id: str, *, keep: int | None = 
     async with sdk.db.session_scope() as s:
         await s.execute(
             text(
-                f"UPDATE {SCHEMA}.stories SET status = 'stopped', updated_at = NOW() "
+                f"UPDATE {SCHEMA}.stories SET status = 'stopped', updated_at = NOW(), "
+                "ended_at = COALESCE(ended_at, NOW()) "
                 "WHERE room_id = :room AND status IN ('writing', 'playing') "
                 "AND (CAST(:keep AS BIGINT) IS NULL OR id <> :keep)"
             ),
@@ -742,6 +750,11 @@ async def tick(sdk: PluginSDK) -> None:
                     error=str(e)[:300],
                     **({"status": "failed"} if failed else {}),
                 )
+                if failed and story["room_id"]:
+                    # Nothing reached the room: whoever asked is waiting
+                    # in the dark, so the room says so (once: the story
+                    # is failed now, and the writer never sees it again).
+                    await _say_it_failed(sdk, story["room_id"])
                 if not failed:
                     # A passage failed mid-story: count it written so the
                     # story ends on what it has rather than looping.
@@ -749,35 +762,62 @@ async def tick(sdk: PluginSDK) -> None:
         await _tidy(sdk)
 
 
+#: What a room hears when its story never started.
+COULDNT_START = "Sorry, I couldn't start the story. Try again in a minute."
+
+
+async def _say_it_failed(sdk: PluginSDK, room_id: str) -> None:
+    """Best effort: an offline room or quiet hours just isn't reached,
+    and an announcement that raises never breaks the writer."""
+    try:
+        await sdk.speech.announce(room_id, COULDNT_START)
+    except Exception as e:  # noqa: BLE001
+        log.warning("storytime: couldn't tell %s the story failed: %s", room_id, e)
+
+
 async def _tidy(sdk: PluginSDK) -> None:
-    """Delete the files of stories that finished more than ``KEEP_HOURS``
-    ago (their rows stay, without segments)."""
-    cutoff = _now() - timedelta(hours=KEEP_HOURS)
+    """Retention for finished stories (live ones are never touched):
+
+    * ``KEEP_HOURS`` after a story ends its audio files are deleted; the
+      passages' text stays (the Sleep page's history shows it);
+    * ``HISTORY_DAYS`` after it ends the row goes, and its passages'
+      text with it (ON DELETE CASCADE).
+    """
+    now = _now()
+    files_cutoff = now - timedelta(hours=KEEP_HOURS)
+    rows_cutoff = now - timedelta(days=HISTORY_DAYS)
+    ended = (
+        "status NOT IN ('writing', 'playing') "
+        "AND COALESCE(ended_at, updated_at) < :cutoff"
+    )
     async with sdk.db.session_scope() as s:
-        rows = (
+        files = (
             await s.execute(
                 text(
-                    f"SELECT g.story_id, g.filename FROM {SCHEMA}.story_segments g "
+                    f"SELECT g.filename FROM {SCHEMA}.story_segments g "
                     f"JOIN {SCHEMA}.stories t ON t.id = g.story_id "
-                    "WHERE t.status NOT IN ('writing', 'playing') "
-                    "AND t.updated_at < :cutoff"
+                    "WHERE NOT t.files_tidied "
+                    "AND t.status NOT IN ('writing', 'playing') "
+                    "AND COALESCE(t.ended_at, t.updated_at) < :cutoff"
                 ),
-                {"cutoff": cutoff},
+                {"cutoff": files_cutoff},
             )
-        ).all()
-        if not rows:
-            return
-        folder = stories_dir(sdk.config, sdk.core_config.music_dir)
-        for _story_id, filename in rows:
-            try:
-                (folder / filename).unlink(missing_ok=True)
-            except OSError as e:
-                log.debug("storytime: could not delete %s: %s", filename, e)
+        ).scalars().all()
+        if files:
+            folder = stories_dir(sdk.config, sdk.core_config.music_dir)
+            for filename in files:
+                try:
+                    (folder / filename).unlink(missing_ok=True)
+                except OSError as e:
+                    log.debug("storytime: could not delete %s: %s", filename, e)
         await s.execute(
             text(
-                f"DELETE FROM {SCHEMA}.story_segments WHERE story_id IN ("
-                f"SELECT id FROM {SCHEMA}.stories "
-                "WHERE status NOT IN ('writing', 'playing') AND updated_at < :cutoff)"
+                f"UPDATE {SCHEMA}.stories SET files_tidied = TRUE "
+                f"WHERE NOT files_tidied AND {ended}"
             ),
-            {"cutoff": cutoff},
+            {"cutoff": files_cutoff},
+        )
+        await s.execute(
+            text(f"DELETE FROM {SCHEMA}.stories WHERE {ended}"),
+            {"cutoff": rows_cutoff},
         )

@@ -58,8 +58,16 @@ Near the end the story slows down, and it lands a sleepy ending on time.
   playing after the story ends until the default sleep timer runs out.
 * **Needs** Domovoi 1.9+ (SDK `speech.render`) and the household's AI
   features on. Nothing leaves the machine. Passages are written next to
-  the sleep sounds (`Ambient sounds/Stories/`) and deleted 12 hours after
-  the story ends.
+  the sleep sounds (`Ambient sounds/Stories/`) and their audio is deleted
+  12 hours after the story ends.
+* **Story history** — the Sleep page lists the stories told in the last
+  30 days, newest first, loading more as you scroll: the title, what it
+  was about, the room (or "in a browser"), when, how long it ran and how
+  it ended. Open one to read it; download one story, or the whole list
+  (or one room's), as a Markdown (`.md`) file. A story's words and its
+  entry are deleted 30 days after it ends.
+* **If a room's story can't start** (the model or the room's player
+  isn't answering), the room says so out loud, once.
 
 ## Install
 

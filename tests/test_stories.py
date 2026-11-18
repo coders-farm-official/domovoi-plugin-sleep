@@ -176,8 +176,15 @@ def story_env(live_sdk, monkeypatch):
 
     monkeypatch.setattr(stories, "generate", fake_generate)
     monkeypatch.setattr(stories.sounds, "_encode_ogg", fake_encode)
-    sdk.speech = SimpleNamespace(render=fake_render)
-    return SimpleNamespace(sdk=sdk, clients=clients, prompts=prompts, rendered=rendered)
+    announced: list[tuple[str | None, str]] = []
+
+    async def fake_announce(room_id, text_):
+        announced.append((room_id, text_))
+        return [room_id] if room_id else []
+
+    sdk.speech = SimpleNamespace(render=fake_render, announce=fake_announce)
+    return SimpleNamespace(sdk=sdk, clients=clients, prompts=prompts, rendered=rendered,
+                           announced=announced)
 
 
 @requires_db
@@ -337,6 +344,73 @@ async def test_a_failed_first_passage_is_reported(story_env, monkeypatch):
     assert st["status"] == "failed" and "ollama" in st["error"]
 
 
+# ─── a room story that never started says so out loud ────────────────────
+
+
+async def _dead_model(*a, **kw):
+    raise RuntimeError("ollama is not running")
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_a_room_story_that_never_started_is_announced_once(story_env, monkeypatch):
+    sdk = story_env.sdk
+    monkeypatch.setattr(stories, "generate", _dead_model)
+    story = await stories.start(sdk, room_id="bedroom", minutes=10)
+    await stories.tick(sdk)
+    await stories.tick(sdk)                  # failed: never written again
+
+    assert (await stories.get(sdk, story["id"]))["status"] == "failed"
+    assert story_env.announced == [("bedroom", stories.COULDNT_START)]
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_a_failure_after_the_story_played_stays_quiet(story_env, monkeypatch):
+    sdk = story_env.sdk
+    story = await stories.start(sdk, room_id="bedroom", minutes=20)
+    await stories.tick(sdk)                  # passage 1 reaches the room
+    first = stories.segment_uri(sdk.config, stories.segment_filename(story["id"], 1))
+    story_env.clients["bedroom"].program(state="play", current={"file": first})
+
+    monkeypatch.setattr(stories, "generate", _dead_model)
+    await stories.tick(sdk)                  # passage 2 fails
+
+    st = await stories.get(sdk, story["id"])
+    assert st["status"] == "playing" and st["writing_done"] and "ollama" in st["error"]
+    assert story_env.announced == []
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_a_browser_story_failure_is_not_announced(story_env, monkeypatch):
+    sdk = story_env.sdk
+    monkeypatch.setattr(stories, "generate", _dead_model)
+    story = await stories.start(sdk, room_id=None, minutes=10)
+    await stories.tick(sdk)
+
+    assert (await stories.get(sdk, story["id"]))["status"] == "failed"
+    assert story_env.announced == []
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_an_announcement_that_raises_never_breaks_the_writer(story_env, monkeypatch):
+    sdk = story_env.sdk
+    monkeypatch.setattr(stories, "generate", _dead_model)
+
+    async def broken_announce(room_id, text_):
+        raise RuntimeError("no satellites")
+
+    sdk.speech.announce = broken_announce
+    failing = await stories.start(sdk, room_id="bedroom", minutes=10)
+    other = await stories.start(sdk, room_id="kids_room", minutes=10)
+    await stories.tick(sdk)                  # must not raise
+
+    assert (await stories.get(sdk, failing["id"]))["status"] == "failed"
+    assert (await stories.get(sdk, other["id"]))["status"] == "failed"
+
+
 # ─── the room's player only plays what its database knows ────────────────
 
 
@@ -454,3 +528,126 @@ async def test_a_first_passage_the_room_wont_play_is_a_failed_story(story_env, m
     assert st["status"] == "failed"
     assert "wouldn't start the story" in st["error"]
     assert await sessions.active_session(sdk, "dining_room") is None
+
+
+# ─── the page hears every way a story ends ──────────────────────────────
+#
+# Reported 2026-11-17: the Sleep page kept showing a story as playing
+# well after it was over. The page re-reads on the ``sleep.sessions``
+# snapshot changing; these pin that every end changes the snapshot (and
+# sends the NOTIFY that wakes it at once).
+
+
+async def _snapshot(sdk):
+    from domovoi_plugin_sleep import web as web_mod
+
+    async with sdk.db.session_scope() as s:
+        await s.execute(text("SET search_path TO plugin_sleep, public"))
+        return await web_mod.snapshot_sessions(s)
+
+
+async def _play_story_to_its_end(story_env, **kw):
+    """A 3-minute room story, written to its ending, listener keeping up."""
+    sdk = story_env.sdk
+    story = await stories.start(sdk, room_id="bedroom", minutes=3, **kw)
+    for _ in range(4):
+        st = await stories.get(sdk, story["id"])
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE plugin_sleep.stories SET playback_started_at = :t WHERE id = :id"),
+                {"t": datetime.now(timezone.utc) - timedelta(seconds=st["audio_sec"] + 1),
+                 "id": story["id"]},
+            )
+        await stories.tick(sdk)
+    assert (await stories.get(sdk, story["id"]))["writing_done"] is True
+    return story
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_a_story_with_a_sound_under_it_is_over_when_its_ending_has_played(story_env):
+    # The ending played and the room went on to the sleep sound: the story
+    # used to stay "telling" (and the room card "story") until the sleep
+    # timer ran out, 45 minutes later.
+    sdk = story_env.sdk
+    folder = stories.sounds.sounds_dir(sdk.core_config.music_dir, sdk.config.sounds_subdir)
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "gentle hum.ogg").write_bytes(b"OggS")
+    story = await _play_story_to_its_end(story_env, bed_sound="gentle hum")
+    bed = stories.sounds.resolve(sdk.config, sdk.core_config.music_dir, "gentle hum")
+    bed_uri = stories.sounds.mpd_uri(sdk.config, bed)
+    stop_at = (await sessions.active_session(sdk, "bedroom"))["stop_at"]
+    assert stop_at is not None                       # the sleep timer, from the ending
+
+    # Still on the last passage: still the story.
+    last = stories.segment_uri(sdk.config, stories.segment_filename(story["id"], 2))
+    story_env.clients["bedroom"].program(state="play", current={"file": last})
+    await sessions.enforce(sdk)
+    assert (await stories.get(sdk, story["id"]))["status"] == "playing"
+
+    sdk.realtime.notified.clear()
+    story_env.clients["bedroom"].program(state="play", current={"file": bed_uri})
+    await sessions.enforce(sdk)
+
+    assert (await stories.get(sdk, story["id"]))["status"] == "done"
+    active = await sessions.active_session(sdk, "bedroom")
+    assert active["sound_key"] == bed.key and active["mpd_uri"] == bed_uri
+    assert active["stop_at"] == stop_at              # the timer carries on
+    assert sdk.realtime.notified                     # the page hears it now
+    snap = await _snapshot(sdk)
+    assert snap["stories"] == []
+    assert [s["sound_key"] for s in snap["sessions"]] == [bed.key]
+
+    # Later ticks leave the sound alone until its timer.
+    await sessions.enforce(sdk)
+    await stories.tick(sdk)
+    assert (await sessions.active_session(sdk, "bedroom"))["sound_key"] == bed.key
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_a_story_that_plays_out_leaves_the_snapshot(story_env):
+    sdk = story_env.sdk
+    story = await _play_story_to_its_end(story_env)
+    assert [s["id"] for s in (await _snapshot(sdk))["stories"]] == [story["id"]]
+
+    sdk.realtime.notified.clear()
+    story_env.clients["bedroom"].program(state="stop", current=None)
+    await sessions.enforce(sdk)                      # the room ran out: session ends
+    await stories.tick(sdk)                          # ...and the story is done
+
+    assert (await stories.get(sdk, story["id"]))["status"] == "done"
+    reasons = [r for _, r in sdk.realtime.notified]
+    assert "ended" in reasons and "story" in reasons
+    assert await _snapshot(sdk) == {"sessions": [], "stories": []}
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_every_other_way_a_story_ends_is_heard(story_env, monkeypatch):
+    sdk = story_env.sdk
+
+    # Stopped by voice ("stop the story").
+    a = await stories.start(sdk, room_id="bedroom", minutes=10)
+    await stories.tick(sdk)
+    sdk.realtime.notified.clear()
+    await stories.mark_stopped(sdk, a["id"])
+    assert sdk.realtime.notified
+
+    # The room moved on to something else.
+    b = await stories.start(sdk, room_id="den", minutes=10)
+    await stories.tick(sdk)
+    story_env.clients["den"].program(state="play", current={"file": "Music/song.mp3"})
+    sdk.realtime.notified.clear()
+    await sessions.enforce(sdk)
+    await stories.tick(sdk)
+    assert (await stories.get(sdk, b["id"]))["status"] == "stopped"
+    assert {"ended", "story"} <= {r for _, r in sdk.realtime.notified}
+
+    # Failed before it started.
+    monkeypatch.setattr(stories, "generate", _dead_model)
+    c = await stories.start(sdk, room_id="attic", minutes=10)
+    sdk.realtime.notified.clear()
+    await stories.tick(sdk)
+    assert (await stories.get(sdk, c["id"]))["status"] == "failed"
+    assert sdk.realtime.notified

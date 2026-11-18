@@ -7,7 +7,7 @@
 [plugin]
 slug = "sleep"
 name = "Sleep Sounds"
-version = "1.3.1"
+version = "1.4.0"
 publisher = "Coders Farm"
 license = "MIT"
 description = "Per-room sleep sounds, synthesized locally (white / pink / brown noise, soft fan, ocean swells, plus procedurally generated rain, thunderstorm, wind, crickets, campfire, and stream) — no downloads, no accounts, works fully offline. 'Play rain sounds in the bedroom for 45 minutes' fades out and stops on its own; drop your own recordings into the sounds folder to add more. Storytime: 'tell a huge bedtime story about otters in the kids room' — an AI story, written by the house's own model as it plays, read in the room's voice for as long as you ask."
@@ -78,7 +78,7 @@ warnings = [
   "Runs ffmpeg on your machine to synthesize the sound files (one-time, a few seconds per sound; regenerated only when settings change).",
   "Writes the generated sound files into a subfolder of your music library (default 'Ambient sounds', roughly 30 MB per hour per sound) so the per-room players can play them.",
   "Needs no network at all — nothing is downloaded and nothing leaves your machine.",
-  "Storytime uses this Domovoi's own AI model (Ollama, on this machine) to write stories and writes their audio next to the sleep sounds; finished stories' files are deleted after 12 hours. Nothing is sent anywhere.",
+  "Storytime uses this Domovoi's own AI model (Ollama, on this machine) to write stories and writes their audio next to the sleep sounds; finished stories' audio files are deleted after 12 hours, and their text and history entry after 30 days. Nothing is sent anywhere.",
 ]
 
 [web]
