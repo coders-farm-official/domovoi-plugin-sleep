@@ -119,6 +119,16 @@ def segment_uri(cfg, filename: str) -> str:
     return f"{cfg.sounds_subdir}/{STORIES_SUBDIR}/{filename}"
 
 
+def stories_folder_uri(cfg) -> str:
+    """The MPD URI of the Stories folder: what a room's player is told to
+    read after a passage is written. Never the passage's own file URI:
+    MPD (0.23) skips ``update <file>`` while the file's folder is not in
+    its database yet, which it never is for a house's (or a room's) first
+    story, so the first passage was "No such song" and nothing played.
+    ``update <folder>`` adds missing folders and reads only what changed."""
+    return f"{cfg.sounds_subdir}/{STORIES_SUBDIR}"
+
+
 def story_uri_prefix(cfg, story_id: int) -> str:
     return f"{cfg.sounds_subdir}/{STORIES_SUBDIR}/story-{story_id}-"
 
@@ -601,7 +611,7 @@ async def _to_room(sdk: PluginSDK, story: dict[str, Any], seg: dict[str, Any]) -
     cfg = sdk.config
     uri = segment_uri(cfg, seg["filename"])
     client = await sdk.playback.mpd_client_for(room_id)
-    await client.update_paths([uri])
+    await client.update_paths([stories_folder_uri(cfg)])
 
     active = await sessions.active_session(sdk, room_id)
     ours = active is not None and story_id_of(active["sound_key"]) == story["id"]
@@ -700,6 +710,11 @@ async def tick(sdk: PluginSDK) -> None:
     async with lock:
         for story in await live_stories(sdk):
             now = _now()
+            # Whether anything of this story reached its listener before
+            # this pass: the row is re-read after the passage is written,
+            # so its segment count can't tell a first passage that never
+            # reached the room from a later one.
+            started = story["segments"] > 0
             try:
                 if story["writing_done"]:
                     await _settle_finished(sdk, story, now)
@@ -721,7 +736,7 @@ async def tick(sdk: PluginSDK) -> None:
                         await _finish_in_room(sdk, story)
             except Exception as e:  # noqa: BLE001 - one story's failure is its own
                 log.exception("storytime: story %s failed", story["id"])
-                failed = story["segments"] == 0
+                failed = not started
                 await _update(
                     sdk, story["id"], notify="story",
                     error=str(e)[:300],

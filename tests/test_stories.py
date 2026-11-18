@@ -200,7 +200,7 @@ async def test_a_room_story_starts_in_the_rooms_voice(story_env):
     assert any(c["action"] == "dispatch" for c in sdk.playback.calls)
     active = await sessions.active_session(sdk, "bedroom")
     assert active["sound_key"] == stories.session_key(story["id"])
-    assert story_env.clients["bedroom"].updated == [uri]
+    assert story_env.clients["bedroom"].updated == [stories.stories_folder_uri(sdk.config)]
     out = stories.stories_dir(sdk.config, sdk.core_config.music_dir) / stories.segment_filename(story["id"], 1)
     assert out.exists()
 
@@ -335,3 +335,122 @@ async def test_a_failed_first_passage_is_reported(story_env, monkeypatch):
     await stories.tick(sdk)
     st = await stories.get(sdk, story["id"])
     assert st["status"] == "failed" and "ollama" in st["error"]
+
+
+# ─── the room's player only plays what its database knows ────────────────
+
+
+class IndexingMPD:
+    """A room's MPD the way MPD 0.23 indexes a folder it can't watch (a
+    Docker Desktop bind mount gets no inotify events): a file is playable
+    only once an ``update`` read it. ``update <folder>`` reads the folder
+    from disk, adding it and any missing parents; ``update <file>`` reads
+    the file ONLY when its folder is already in the database, and is
+    silently a no-op otherwise. The second rule is what the first live
+    story hit: the Stories folder is new, so the file update did nothing
+    and the play was "No such song"."""
+
+    def __init__(self, music_dir: str, known_dirs: set[str]) -> None:
+        self.music = music_dir
+        self.dirs = set(known_dirs)
+        self.files: set[str] = set()
+        self._state = "stop"
+
+    async def update_paths(self, uris: list[str]) -> None:
+        from pathlib import Path, PurePosixPath
+
+        for uri in uris:
+            disk = Path(self.music, *PurePosixPath(uri).parts)
+            if disk.is_dir():
+                parts = PurePosixPath(uri).parts
+                for i in range(1, len(parts) + 1):
+                    self.dirs.add("/".join(parts[:i]))
+                for f in disk.rglob("*"):
+                    if f.is_file():
+                        rel = f.relative_to(self.music).as_posix()
+                        self.files.add(rel)
+                        self.dirs.add(str(PurePosixPath(rel).parent))
+            elif disk.is_file() and str(PurePosixPath(uri).parent) in self.dirs:
+                self.files.add(uri)
+
+    async def state(self) -> str:
+        return self._state
+
+    async def queue_add_tracks(self, specs: list[dict]) -> list[dict]:
+        return [{"file": s["file_path"], "id": 1} for s in specs
+                if s["file_path"] in self.files]
+
+
+def _indexing_room(sdk, monkeypatch, *, known_dirs: set[str]) -> IndexingMPD:
+    """The room's player plus a play_url that, like the core's, fails
+    (no music_action) for a file the player's database doesn't have."""
+    from domovoi.models import Response
+
+    mpd = IndexingMPD(sdk.core_config.music_dir, known_dirs)
+
+    async def mpd_client_for(room_id):
+        return mpd
+
+    recorded = sdk.playback.play_url
+
+    async def play_url(room_id, stream_url, **kw):
+        if stream_url not in mpd.files:
+            sdk.playback.calls.append({"action": "play_url_refused",
+                                       "stream_url": stream_url})
+            return Response(text="the music player wouldn't accept the stream.")
+        mpd._state = "pause"
+        return await recorded(room_id, stream_url, **kw)
+
+    async def no_wait(_sec):
+        return None
+
+    sdk.playback.mpd_client_for = mpd_client_for
+    sdk.playback.play_url = play_url
+    monkeypatch.setattr(stories.asyncio, "sleep", no_wait)
+    return mpd
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_the_first_story_plays_in_a_room_that_never_saw_the_stories_folder(
+        story_env, monkeypatch):
+    # Live 2026-11-17, dining room: "Okay, a bedtime story … It'll start
+    # in a moment", then silence: the room's player had the sounds folder
+    # but not Stories/, so the passage was never indexed.
+    sdk = story_env.sdk
+    mpd = _indexing_room(sdk, monkeypatch, known_dirs={sdk.config.sounds_subdir})
+    story = await stories.start(sdk, room_id="dining_room", minutes=3)
+
+    await stories.tick(sdk)
+
+    st = await stories.get(sdk, story["id"])
+    assert st["status"] == "playing" and not st["error"], st["error"]
+    uri = stories.segment_uri(sdk.config, stories.segment_filename(story["id"], 1))
+    assert uri in mpd.files
+    assert [c["stream_url"] for c in sdk.playback.calls if c["action"] == "play_url"] == [uri]
+    assert any(c["action"] == "dispatch" and c["music_action"] == "start"
+               for c in sdk.playback.calls)
+    active = await sessions.active_session(sdk, "dining_room")
+    assert active["sound_key"] == stories.session_key(story["id"])
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_a_first_passage_the_room_wont_play_is_a_failed_story(story_env, monkeypatch):
+    # Written, but it never reached the room: the Sleep page's room card
+    # must show it failed (it shows failed stories for 10 minutes), not
+    # "telling" for a tick and then nothing.
+    sdk = story_env.sdk
+    mpd = _indexing_room(sdk, monkeypatch, known_dirs=set())
+
+    async def update_nothing(uris):
+        return None
+
+    mpd.update_paths = update_nothing
+    story = await stories.start(sdk, room_id="dining_room", minutes=3)
+    await stories.tick(sdk)
+
+    st = await stories.get(sdk, story["id"])
+    assert st["status"] == "failed"
+    assert "wouldn't start the story" in st["error"]
+    assert await sessions.active_session(sdk, "dining_room") is None
