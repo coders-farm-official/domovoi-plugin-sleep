@@ -7,7 +7,7 @@
 [plugin]
 slug = "sleep"
 name = "Sleep Sounds"
-version = "1.4.0"
+version = "1.4.1"
 publisher = "Coders Farm"
 license = "MIT"
 description = "Per-room sleep sounds, synthesized locally (white / pink / brown noise, soft fan, ocean swells, plus procedurally generated rain, thunderstorm, wind, crickets, campfire, and stream) — no downloads, no accounts, works fully offline. 'Play rain sounds in the bedroom for 45 minutes' fades out and stops on its own; drop your own recordings into the sounds folder to add more. Storytime: 'tell a huge bedtime story about otters in the kids room' — an AI story, written by the house's own model as it plays, read in the room's voice for as long as you ask."

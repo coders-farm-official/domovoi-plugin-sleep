@@ -14,6 +14,16 @@
 
 from __future__ import annotations
 
+# First, before anything imports the rest of domovoi: HOME/USERPROFILE become a
+# temp folder, so loading the plugin through core's loader never writes the
+# real ~/.domovoi (logs/plugin_<slug>.log). The guard fails the run, naming
+# the paths, if the real home changed anyway. Same module core's own root
+# conftest uses (domovoi/tests/home_isolation.py).
+from domovoi.tests import home_isolation  # noqa: E402  (stdlib only)
+
+home_isolation.isolate()
+home_isolation.start_guard()
+
 import asyncio
 import os
 import socket
@@ -213,3 +223,16 @@ async def live_sdk(tmp_path):
     )
     yield sdk
     sdk.teardown()
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session):
+    home_isolation.check_guard(session)
+
+
+def pytest_terminal_summary(terminalreporter):
+    home_isolation.write_report(terminalreporter)
+
+
+def pytest_unconfigure(config):
+    home_isolation.cleanup()
