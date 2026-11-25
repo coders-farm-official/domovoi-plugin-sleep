@@ -41,8 +41,33 @@ print("SDK", sdk.API_VERSION)
 """
 
 
+_SITECUSTOMIZE = (
+    "import sys\n"
+    "sys.meta_path[:] = [f for f in sys.meta_path\n"
+    "                    if 'editable' not in type(f).__name__.lower()\n"
+    "                    and 'editable' not in getattr(f, '__name__', '').lower()\n"
+    "                    and '__editable__' not in getattr(f, '__module__', '')]\n"
+)
+_NO_EDITABLE: list[Path] = []
+
+
+def _no_editable_dir() -> Path:
+    """A folder whose ``sitecustomize`` drops an editable install's import
+    finder: in a development venv (``pip install -e`` of a Domovoi
+    checkout) that finder serves any ``domovoi.*`` module the archived
+    core lacks from the checkout instead, so an old core would quietly
+    gain newer modules (a real v1.4.0 house has no ``domovoi.home_location``)."""
+    if not _NO_EDITABLE:
+        import tempfile
+
+        d = Path(tempfile.mkdtemp(prefix="no-editable-"))
+        (d / "sitecustomize.py").write_text(_SITECUSTOMIZE, encoding="utf-8")
+        _NO_EDITABLE.append(d)
+    return _NO_EDITABLE[0]
+
+
 def _run(core: Path, args: list[str], home: Path) -> subprocess.CompletedProcess:
-    env = {**os.environ, "PYTHONPATH": str(core), "PYTHONUTF8": "1",
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(_no_editable_dir()), str(core)]), "PYTHONUTF8": "1",
            "DOMOVOI_TEST_HOME_GUARD": "off", "HOME": str(home), "USERPROFILE": str(home)}
     return subprocess.run([sys.executable, *args], cwd=PLUGIN_ROOT, env=env,
                           capture_output=True, text=True, timeout=600)
